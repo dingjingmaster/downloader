@@ -24,6 +24,9 @@ add_executable(downloader
     daemon/filesystem.c
     daemon/scheduler.c
     daemon/ipc.c
+    daemon/web.c
+    daemon/web-api.c
+    daemon/task-manager.c
     protocols/http.c
 )
 
@@ -34,6 +37,7 @@ target_include_directories(
 )
 
 target_link_libraries(downloader PRIVATE clib::static Threads::Threads SQLite3::SQLite3 CURL::libcurl)
+target_compile_definitions(downloader PRIVATE DOWNLOADER_WEB_ROOT="${CMAKE_INSTALL_PREFIX}/share/downloader/web")
 
 set_target_properties(
     downloader
@@ -45,6 +49,7 @@ set_target_properties(
 
 install(TARGETS downloader RUNTIME DESTINATION bin)
 install(FILES config/download.ini DESTINATION /etc/downloader)
+install(DIRECTORY web/ DESTINATION share/downloader/web)
 
 option(DOWNLOADER_BUILD_TESTS "Build downloader tests" ON)
 if(DOWNLOADER_BUILD_TESTS)
@@ -56,6 +61,63 @@ if(DOWNLOADER_BUILD_TESTS)
     target_include_directories(test_config PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
     target_link_libraries(test_config PRIVATE clib::static Threads::Threads)
     add_test(NAME downloader_config COMMAND test_config)
+
+    add_executable(test_web_config
+        tests/test-web-config.c
+        daemon/config.c
+    )
+    target_include_directories(test_web_config PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
+    target_link_libraries(test_web_config PRIVATE clib::static Threads::Threads)
+    add_test(NAME downloader_web_config COMMAND test_web_config)
+
+    add_executable(test_web_lifecycle
+        tests/test-web-lifecycle.c
+        daemon/web.c
+    )
+    target_include_directories(test_web_lifecycle PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
+    target_link_libraries(test_web_lifecycle PRIVATE clib::static Threads::Threads)
+    add_test(NAME downloader_web_lifecycle COMMAND test_web_lifecycle)
+
+    add_executable(test_task_manager
+        daemon/protocol.c
+        daemon/scheduler.c
+        tests/test-task-manager.c
+        daemon/task-manager.c
+        daemon/database.c
+        daemon/task.c
+        daemon/filesystem.c
+    )
+    target_include_directories(test_task_manager PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
+    target_link_libraries(test_task_manager PRIVATE clib::static Threads::Threads SQLite3::SQLite3)
+    add_test(NAME downloader_task_manager COMMAND test_task_manager)
+
+    add_executable(test_web_api
+        daemon/protocol.c
+        daemon/scheduler.c
+        tests/test-web-api.c
+        daemon/web-api.c
+        daemon/task-manager.c
+        daemon/database.c
+        daemon/task.c
+        daemon/filesystem.c
+    )
+    target_include_directories(test_web_api PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
+    target_link_libraries(test_web_api PRIVATE clib::static Threads::Threads SQLite3::SQLite3)
+    add_test(NAME downloader_web_api COMMAND test_web_api)
+
+    add_executable(test_web_static
+        tests/test-web-static.c
+        daemon/web.c
+    )
+    target_include_directories(test_web_static PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
+    target_link_libraries(test_web_static PRIVATE clib::static Threads::Threads)
+    add_test(NAME downloader_web_static COMMAND test_web_static)
+
+    add_executable(test_web_e2e
+        tests/test-web-e2e.c
+    )
+    target_link_libraries(test_web_e2e PRIVATE clib::static Threads::Threads)
+    add_test(NAME downloader_web_e2e COMMAND test_web_e2e $<TARGET_FILE:downloader>)
 
     add_executable(test_database
         tests/test-database.c

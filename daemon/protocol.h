@@ -14,6 +14,7 @@ typedef struct ProtocolOps ProtocolOps;
 typedef struct
 {
     void (*onStarted) (void* userData);
+    void (*onFileName) (void* userData, const char* name);
     void (*onProgress) (void* userData, uint64_t totalBytes, uint64_t downloadedBytes, uint64_t speedBytesSec);
     void (*onPaused) (void* userData);
     void (*onCompleted) (void* userData);

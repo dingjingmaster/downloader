@@ -6,6 +6,10 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
+#include <clib/uri.h>
+
+static size_t http_header (char* header, size_t size, size_t count, void* userData);
 
 struct ProtocolTask
 {
@@ -30,17 +34,21 @@ static size_t http_write (const void* data, size_t size, size_t count, void* use
 {
     ProtocolTask* task = (ProtocolTask*)userData;
 
-    return fwrite (data, size, count, task->file);
+    return fwrite (data, 1, size * count, task->file);
 }
 
-static int http_progress (void* userData, curl_off_t total, curl_off_t downloaded, curl_off_t speed)
+static int http_progress (void* userData, curl_off_t total, curl_off_t downloaded, curl_off_t uploadTotal, curl_off_t uploaded)
 {
     ProtocolTask* task = (ProtocolTask*)userData;
+    curl_off_t speed = 0;
+    (void)uploadTotal;
+    (void)uploaded;
+    curl_easy_getinfo (task->curl, CURLINFO_SPEED_DOWNLOAD_T, &speed);
 
     if (task->cancelRequested || task->pauseRequested)
         return 1;
     if (task->callbacks != NULL && task->callbacks->onProgress != NULL) {
-        task->callbacks->onProgress (task->userData, (uint64_t)total, task->initialBytes + (uint64_t)downloaded,
+        task->callbacks->onProgress (task->userData, total > 0 ? task->initialBytes + (uint64_t)total : 0, task->initialBytes + (uint64_t)downloaded,
                                      (uint64_t)(speed < 0 ? 0 : speed));
     }
     return 0;
@@ -81,7 +89,12 @@ static int http_open (ProtocolTask** result, const DownloadTask* task, const Pro
     }
     (void)curl_easy_setopt (context->curl, CURLOPT_URL, task->resourceUrl);
     (void)curl_easy_setopt (context->curl, CURLOPT_FOLLOWLOCATION, 1L);
+    (void)curl_easy_setopt (context->curl, CURLOPT_FAILONERROR, 1L);
+    (void)curl_easy_setopt (context->curl, CURLOPT_NOSIGNAL, 1L);
+    (void)curl_easy_setopt (context->curl, CURLOPT_CONNECTTIMEOUT, 30L);
     (void)curl_easy_setopt (context->curl, CURLOPT_WRITEFUNCTION, http_write);
+    (void)curl_easy_setopt (context->curl, CURLOPT_HEADERFUNCTION, http_header);
+    (void)curl_easy_setopt (context->curl, CURLOPT_HEADERDATA, context);
     (void)curl_easy_setopt (context->curl, CURLOPT_WRITEDATA, context);
     (void)curl_easy_setopt (context->curl, CURLOPT_XFERINFOFUNCTION, http_progress);
     (void)curl_easy_setopt (context->curl, CURLOPT_XFERINFODATA, context);
@@ -90,6 +103,48 @@ static int http_open (ProtocolTask** result, const DownloadTask* task, const Pro
         (void)curl_easy_setopt (context->curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)task->downloadedBytes);
     *result = context;
     return 0;
+}
+
+static size_t http_header (char* header, size_t size, size_t count, void* userData)
+{
+    ProtocolTask* task = userData;
+    size_t length = size * count;
+    char line[4096];
+    char* name = NULL;
+    bool encoded = false;
+    if (length >= sizeof (line) || length < 20 || strncasecmp (header, "Content-Disposition:", 20) != 0)
+        return length;
+    memcpy (line, header, length);
+    line[length] = '\0';
+    for (char* part = line + 20; *part; part++) {
+        if (strncasecmp (part, "filename*=UTF-8''", 17) == 0) {
+            name = part + 17;
+            encoded = true;
+            break;
+        }
+        if (strncasecmp (part, "filename=", 9) == 0)
+            name = part + 9;
+    }
+    if (name != NULL) {
+        if (*name == '"') {
+            name++;
+            char* end = strchr (name, '"');
+            if (end != NULL)
+                *end = '\0';
+        } else {
+            name[strcspn (name, ";\r\n")] = '\0';
+        }
+        char* decoded = NULL;
+        size_t decodedSize = 0;
+        if (encoded && c_uri_unescape_string (c_string_view_from_cstr (name), &decoded, &decodedSize) == 0) {
+            if (memchr (decoded, '\0', decodedSize) == NULL)
+                name = decoded;
+        }
+        if (task->callbacks && task->callbacks->onFileName)
+            task->callbacks->onFileName (task->userData, name);
+        c_free (decoded);
+    }
+    return length;
 }
 
 static int http_run (ProtocolTask* task)
@@ -103,7 +158,8 @@ static int http_run (ProtocolTask* task)
     if (task->callbacks != NULL && task->callbacks->onStarted != NULL)
         task->callbacks->onStarted (task->userData);
     result = curl_easy_perform (task->curl);
-    (void)fclose (task->file);
+    if (fclose (task->file) != 0 && result == CURLE_OK)
+        result = CURLE_WRITE_ERROR;
     task->file = NULL;
     if (result == CURLE_OK) {
         if (task->callbacks != NULL && task->callbacks->onCompleted != NULL)

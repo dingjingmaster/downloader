@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Downloader</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="container">
+    <header><h1>↓ Downloader</h1><p>管理下载，掌握每一份进度</p></header>
+    <div class="toolbar">
+      <div class="button-row"><button id="new-task" class="primary">＋ 新建任务</button>
+      <button id="clear-completed">清空已完成</button></div>
+      <span id="summary" role="status"></span>
+    </div>
+    <dialog id="create-dialog">
+    <h2>新建下载任务</h2>
+    <form id="create-form">
+      <label>下载链接<input name="url" type="url" placeholder="粘贴下载链接，例如 https://…" required></label>
+      <label>下载位置（可选）
+        <div class="folder-field"><input name="target_directory" placeholder="默认下载位置" readonly>
+          <button type="button" id="choose-directory">选择文件夹</button>
+          <button type="button" id="reset-directory">默认</button></div>
+      </label>
+      <p id="create-error" role="alert"></p>
+      <div class="dialog-actions button-row">
+        <button type="button" id="cancel-create">取消</button>
+        <button type="submit" class="primary">创建任务</button>
+      </div>
+    </form>
+    </dialog>
+    <dialog id="directory-dialog">
+      <h2>选择文件夹</h2>
+      <div class="button-row"><button type="button" id="directory-up">上一级</button><span id="directory-path"></span></div>
+      <label class="directory-options"><input type="checkbox" id="show-hidden-directories">显示隐藏文件夹</label>
+      <p id="directory-error" role="alert"></p>
+      <div id="directory-list" aria-label="文件夹列表"></div>
+      <div class="dialog-actions button-row">
+        <button type="button" id="directory-cancel">取消</button>
+        <button type="button" id="directory-select" class="primary">选择此文件夹</button>
+      </div>
+    </dialog>
+    <div class="table-scroll">
+    <table>
+      <thead><tr><th>文件</th><th>协议</th><th>状态</th><th>进度</th><th>大小</th><th>操作</th></tr></thead>
+      <tbody id="tasks"></tbody>
+    </table>
+    </div>
+    <div class="pagination">
+      <button id="previous">上一页</button>
+      <span id="page-label"></span>
+      <button id="next">下一页</button>
+    </div>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

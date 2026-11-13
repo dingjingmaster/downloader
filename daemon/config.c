@@ -21,6 +21,9 @@ struct Config
     char*   database;
     char*   tempSuffix;
     char*   overwritePolicy;
+    char*   webListen;
+    bool    webEnabled;
+    int32_t webPort;
     int32_t maxConcurrentTasks;
     int32_t maxRetries;
     int32_t connectTimeout;
@@ -66,6 +69,35 @@ static int config_get_int32 (const CKeyFile* keyFile, const char* group, const c
     if (errno != ENOENT)
         return -1;
     *value = fallback;
+    return 0;
+}
+
+static int config_get_boolean (const CKeyFile* keyFile, const char* group, const char* key, bool fallback, bool* value)
+{
+    char*       rawValue;
+    CStringView trimmedValue;
+
+    if (c_key_file_get_string (keyFile, c_string_view_from_cstr (group), c_string_view_from_cstr (key), &rawValue) != 0) {
+        if (errno != ENOENT)
+            return -1;
+        *value = fallback;
+        return 0;
+    }
+    trimmedValue = c_string_view_trim_ascii (c_string_view_from_cstr (rawValue));
+    if ((trimmedValue.size == 4U && strncmp (trimmedValue.data, "true", trimmedValue.size) == 0) ||
+        (trimmedValue.size == 3U && strncmp (trimmedValue.data, "yes", trimmedValue.size) == 0) ||
+        (trimmedValue.size == 1U && trimmedValue.data[0] == '1')) {
+        *value = true;
+    } else if ((trimmedValue.size == 5U && strncmp (trimmedValue.data, "false", trimmedValue.size) == 0) ||
+               (trimmedValue.size == 2U && strncmp (trimmedValue.data, "no", trimmedValue.size) == 0) ||
+               (trimmedValue.size == 1U && trimmedValue.data[0] == '0')) {
+        *value = false;
+    } else {
+        c_free (rawValue);
+        errno = EINVAL;
+        return -1;
+    }
+    c_free (rawValue);
     return 0;
 }
 
@@ -133,6 +165,12 @@ static int config_load_values (Config* config, const CKeyFile* keyFile)
         return -1;
     if (config_get_string (keyFile, "download", "overwrite_policy", "resume", &config->overwritePolicy) != 0)
         return -1;
+    if (config_get_boolean (keyFile, "web", "enabled", true, &config->webEnabled) != 0)
+        return -1;
+    if (config_get_string (keyFile, "web", "listen", "0.0.0.0", &config->webListen) != 0)
+        return -1;
+    if (config_get_int32 (keyFile, "web", "port", 8000, &config->webPort) != 0)
+        return -1;
     if (config_get_int32 (keyFile, "download", "max_concurrent_tasks", 3, &config->maxConcurrentTasks) != 0)
         return -1;
     if (config_get_int32 (keyFile, "download", "max_retries", 3, &config->maxRetries) != 0)
@@ -143,7 +181,7 @@ static int config_load_values (Config* config, const CKeyFile* keyFile)
         return -1;
 
     if (config->maxConcurrentTasks <= 0 || config->maxRetries < 0 || config->connectTimeout < 0 ||
-        config->transferTimeout < 0) {
+        config->transferTimeout < 0 || config->webListen[0] == '\0' || config->webPort < 1 || config->webPort > 65535) {
         errno = EINVAL;
         return -1;
     }
@@ -204,6 +242,7 @@ void config_free (Config* config)
     c_free (config->database);
     c_free (config->tempSuffix);
     c_free (config->overwritePolicy);
+    c_free (config->webListen);
     c_free (config);
 }
 
@@ -214,6 +253,9 @@ const char* config_download_dir (const Config* config) { return config == NULL ?
 const char* config_database (const Config* config) { return config == NULL ? NULL : config->database; }
 const char* config_temp_suffix (const Config* config) { return config == NULL ? NULL : config->tempSuffix; }
 const char* config_overwrite_policy (const Config* config) { return config == NULL ? NULL : config->overwritePolicy; }
+bool config_web_enabled (const Config* config) { return config != NULL && config->webEnabled; }
+const char* config_web_listen (const Config* config) { return config == NULL ? NULL : config->webListen; }
+int32_t config_web_port (const Config* config) { return config == NULL ? 0 : config->webPort; }
 int32_t config_max_concurrent_tasks (const Config* config) { return config == NULL ? 0 : config->maxConcurrentTasks; }
 int32_t config_max_retries (const Config* config) { return config == NULL ? 0 : config->maxRetries; }
 int32_t config_connect_timeout (const Config* config) { return config == NULL ? 0 : config->connectTimeout; }
