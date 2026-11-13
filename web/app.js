@@ -2,6 +2,15 @@
   const pageSize = 20;
   let page = 1;
   let pages = 1;
+  const stateLabels = new Map([
+    ["created", "待开始"],
+    ["queued", "排队中"],
+    ["downloading", "下载中"],
+    ["paused", "已暂停"],
+    ["completed", "已完成"],
+    ["failed", "下载失败"],
+    ["cancelled", "已取消"]
+  ]);
   const escapeHtml = (value) => String(value).replace(/[&<>"']/g, char => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[char]));
@@ -34,7 +43,7 @@
     const rows = body.tasks.map((task) => `<tr>
       <td title="${escapeHtml(task.resource_url)}">${escapeHtml(task.file_name)}</td>
       <td>${escapeHtml(task.protocol)}</td>
-      <td>${escapeHtml(task.state)}</td>
+      <td>${escapeHtml(stateLabels.get(task.state) || "未知状态")}</td>
       <td>${Number(task.progress).toFixed(1)}%</td>
       <td>${formatBytes(task.downloaded_bytes)} / ${formatBytes(task.total_bytes)}</td>
       <td><div class="task-actions">
