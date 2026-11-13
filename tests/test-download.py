@@ -14,6 +14,12 @@ payload = b'downloader-local-fixture\n' * 8192
 
 class Fixture(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == '/ua-required' and not self.headers.get('User-Agent', '').startswith('downloader/'):
+            self.send_error(403, 'denied by UA ACL = blacklist')
+            return
+        if self.path == '/forbidden':
+            self.send_error(403, 'fixture forbidden')
+            return
         offset = int(self.headers.get('Range', 'bytes=0-').split('=')[1].split('-')[0])
         self.send_response(206 if offset else 200)
         if self.path == '/attachment':
@@ -85,6 +91,16 @@ with tempfile.TemporaryDirectory() as directory:
                     return current
                 time.sleep(.02)
             raise AssertionError(current)
+        identifier = create('ua-required.bin', 'ua-required')
+        api('/' + identifier + '/start', {})
+        current = wait_state(identifier, ['completed', 'failed'])
+        assert current['state'] == 'completed', current
+        assert (root / 'ua-required.bin').read_bytes() == payload
+        identifier = create('forbidden.bin', 'forbidden')
+        api('/' + identifier + '/start', {})
+        current = wait_state(identifier, ['completed', 'failed'])
+        assert current['state'] == 'failed' and 'HTTP 403' in current['error_message'], current
+        print('download User-Agent and HTTP error status: PASS')
         identifier = create('resume.bin', 'file')
         (root / f'.{identifier}.part').write_bytes(payload[:8192])
         api('/' + identifier + '/start', {})

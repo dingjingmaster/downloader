@@ -14,6 +14,7 @@
 #include <clib/uri.h>
 
 static size_t http_header (char* header, size_t size, size_t count, void* userData);
+static void http_close (ProtocolTask* task);
 
 struct ProtocolTask
 {
@@ -122,6 +123,13 @@ static int http_open (ProtocolTask** result, const DownloadTask* task, const Pro
         return -1;
     }
     (void)curl_easy_setopt (context->curl, CURLOPT_URL, task->resourceUrl);
+    /* libcurl sends no User-Agent by default; some download CDNs reject that. */
+    curlResult = curl_easy_setopt (context->curl, CURLOPT_USERAGENT, "downloader/0.1.0");
+    if (curlResult != CURLE_OK) {
+        http_close (context);
+        errno = curlResult == CURLE_OUT_OF_MEMORY ? ENOMEM : EIO;
+        return -1;
+    }
     (void)curl_easy_setopt (context->curl, CURLOPT_FOLLOWLOCATION, 1L);
     (void)curl_easy_setopt (context->curl, CURLOPT_FAILONERROR, 1L);
     (void)curl_easy_setopt (context->curl, CURLOPT_NOSIGNAL, 1L);
@@ -205,8 +213,17 @@ static int http_run (ProtocolTask* task)
             task->callbacks->onPaused (task->userData);
         return 1;
     }
-    if (task->callbacks != NULL && task->callbacks->onFailed != NULL)
-        task->callbacks->onFailed (task->userData, (int)result, curl_easy_strerror (result));
+    if (task->callbacks != NULL && task->callbacks->onFailed != NULL) {
+        char message[256];
+        long status = 0;
+        if (result == CURLE_HTTP_RETURNED_ERROR &&
+            curl_easy_getinfo (task->curl, CURLINFO_RESPONSE_CODE, &status) == CURLE_OK && status > 0) {
+            snprintf (message, sizeof (message), "HTTP %ld: %s", status, curl_easy_strerror (result));
+            task->callbacks->onFailed (task->userData, (int)result, message);
+        } else {
+            task->callbacks->onFailed (task->userData, (int)result, curl_easy_strerror (result));
+        }
+    }
     errno = EIO;
     return -1;
 }
