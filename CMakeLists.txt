@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(downloader VERSION 0.1.0 LANGUAGES C)
+project(downloader VERSION 0.1.0 LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -14,6 +18,11 @@ find_package(CURL REQUIRED)
 set(BUILD_TESTING OFF)
 set(BUILD_TESTING OFF CACHE BOOL "Disable clib tests in downloader" FORCE)
 add_subdirectory(clib EXCLUDE_FROM_ALL)
+add_subdirectory(3thrd)
+
+add_library(download_engines STATIC protocols/engines.cpp)
+target_include_directories(download_engines PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/protocols")
+target_link_libraries(download_engines PUBLIC clib::static downloader_aria2 downloader_avformat downloader_smb2)
 
 add_executable(downloader
     daemon/main.c
@@ -36,7 +45,7 @@ target_include_directories(
         "${CMAKE_CURRENT_SOURCE_DIR}/daemon"
 )
 
-target_link_libraries(downloader PRIVATE clib::static Threads::Threads SQLite3::SQLite3 CURL::libcurl)
+target_link_libraries(downloader PRIVATE download_engines clib::static Threads::Threads SQLite3::SQLite3 CURL::libcurl)
 target_compile_definitions(downloader PRIVATE DOWNLOADER_WEB_ROOT="${CMAKE_INSTALL_PREFIX}/share/downloader/web")
 
 set_target_properties(
@@ -54,6 +63,11 @@ install(DIRECTORY web/ DESTINATION share/downloader/web)
 option(DOWNLOADER_BUILD_TESTS "Build downloader tests" ON)
 if(DOWNLOADER_BUILD_TESTS)
     enable_testing()
+    add_executable(test_engines tests/test-engines.c)
+    target_link_libraries(test_engines PRIVATE download_engines)
+    add_test(NAME downloader_engines COMMAND test_engines)
+    set_tests_properties(downloader_engines PROPERTIES
+        ENVIRONMENT "XDG_CONFIG_HOME=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/aria2-config")
     add_executable(test_config
         tests/test-config.c
         daemon/config.c

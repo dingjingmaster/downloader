@@ -18,6 +18,7 @@
 #include "task-manager.h"
 #include "web.h"
 #include "web-api.h"
+#include "engines.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -167,6 +168,10 @@ finish:
 
 int main (int argc, char* argv[])
 {
+    if (argc == 2 && strcmp (argv[1], "--version") == 0) {
+        download_engines_print_versions ();
+        return 0;
+    }
     Daemon daemon;
 
     memset (&daemon, 0, sizeof (daemon));

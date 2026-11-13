@@ -1,3 +1,12 @@
 [submodule "clib"]
 	path = clib
 	url = git@github.com:dingjingmaster/clib.git
+[submodule "3thrd/aria2c"]
+	path = 3thrd/aria2c
+	url = https://github.com/aria2/aria2.git
+[submodule "3thrd/ffmpeg"]
+	path = 3thrd/ffmpeg
+	url = https://github.com/FFmpeg/FFmpeg.git
+[submodule "3thrd/libsmb2"]
+	path = 3thrd/libsmb2
+	url = https://github.com/sahlberg/libsmb2.git

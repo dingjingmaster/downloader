@@ -5,9 +5,15 @@
 ## 构建
 
 ```sh
+git submodule update --init --recursive
 cmake -S . -B build
 cmake --build build
+ctest --test-dir build --output-on-failure
 ```
+
+aria2、FFmpeg、libsmb2 源码位于 `3thrd/`，由 CMake 构建静态库并链接到程序。
+构建依赖、固定版本、许可证和协议接入边界见 [第三方引擎说明](3thrd/README.md)。
+`./build/downloader --version` 可查看内置引擎版本。
 
 ## 配置
 
