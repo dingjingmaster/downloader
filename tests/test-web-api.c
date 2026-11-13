@@ -5,6 +5,7 @@
 #include "web-api.h"
 
 #include <clib/memory.h>
+#include <clib/json.h>
 
 #include <assert.h>
 #include <stdio.h>
@@ -47,6 +48,19 @@ static void test_task_api (TaskManager* manager)
     assert (web_api_handle (manager, &request, &response) == 0);
     assert (response.status == 201);
     assert (strstr (response.body, "new.bin") != NULL);
+    release_response (&response);
+
+    body = "{\"url\":\"smb://example.test/share/%E9%9B%AA.bin\",\"target_directory\":\"/tmp\"}";
+    request = make_request ("POST", "/api/tasks", NULL, body);
+    assert (web_api_handle (manager, &request, &response) == 0 && response.status == 201);
+    size_t errorOffset;
+    CJsonDocument* document = c_json_document_new_from_data (
+        c_string_view_from_data (response.body, response.bodySize), C_JSON_PARSE_NONE, &errorOffset);
+    assert (document != NULL);
+    CJsonValue* task = c_json_object_get (c_json_document_root (document), c_string_view_from_cstr ("task"));
+    CStringView name = c_json_value_get_string (c_json_object_get (task, c_string_view_from_cstr ("file_name")));
+    assert (name.size == strlen ("雪.bin") && memcmp (name.data, "雪.bin", name.size) == 0);
+    c_json_document_free (document);
     release_response (&response);
 }
 

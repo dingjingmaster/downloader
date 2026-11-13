@@ -43,9 +43,9 @@
     const rows = body.tasks.map((task) => `<tr>
       <td title="${escapeHtml(task.resource_url)}">${escapeHtml(task.file_name)}</td>
       <td>${escapeHtml(task.protocol)}</td>
-      <td>${escapeHtml(stateLabels.get(task.state) || "未知状态")}</td>
-      <td>${Number(task.progress).toFixed(1)}%</td>
-      <td>${formatBytes(task.downloaded_bytes)} / ${formatBytes(task.total_bytes)}</td>
+      <td title="${escapeHtml(task.error_message || '')}">${escapeHtml(stateLabels.get(task.state) || "未知状态")}${task.state === 'completed' && task.error_message ? '（同步警告）' : ''}</td>
+      <td>${task.total_bytes || task.state === 'completed' ? Number(task.progress).toFixed(1) + '%' : '—'}</td>
+      <td>${formatBytes(task.downloaded_bytes)} / ${task.total_bytes ? formatBytes(task.total_bytes) : '未知'}</td>
       <td><div class="task-actions">
         <button data-action="start" data-id="${escapeHtml(task.id)}">开始</button>
         <button data-action="pause" data-id="${escapeHtml(task.id)}">暂停</button>

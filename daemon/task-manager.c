@@ -10,6 +10,7 @@
 #include <clib/mutex.h>
 #include <clib/cond.h>
 #include <clib/uri.h>
+#include <clib/directory.h>
 
 #include <errno.h>
 #include <stdio.h>
@@ -33,6 +34,7 @@ struct TaskManager
     ActiveTask* active;
     CCond idle;
     char defaultDirectory[DOWNLOAD_TASK_PATH_SIZE];
+    bool stopping;
 };
 
 int task_manager_set_download_directory (TaskManager* manager, const char* directory)
@@ -164,12 +166,8 @@ int task_manager_create (TaskManager* manager, const char* resourceUrl, const ch
         errno = EINVAL;
         return -1;
     }
-    memcpy (inferredProtocol, uri.scheme.data, uri.scheme.size);
-    inferredProtocol[uri.scheme.size] = '\0';
-    for (char* letter = inferredProtocol; *letter; letter++) {
-        if (*letter >= 'A' && *letter <= 'Z')
-            *letter += 'a' - 'A';
-    }
+    if (protocol_detect (resourceUrl, inferredProtocol, sizeof (inferredProtocol)) != 0)
+        return -1;
     protocol = inferredProtocol;
     if (targetDirectory == NULL || !targetDirectory[0])
         targetDirectory = manager->defaultDirectory;
@@ -195,6 +193,12 @@ int task_manager_create (TaskManager* manager, const char* resourceUrl, const ch
 
     if (manager == NULL || result == NULL || task_manager_validate (resourceUrl, fileName, targetDirectory, protocol) != 0)
         return -1;
+    if (strlen (resourceUrl) >= sizeof (task.resourceUrl) || strlen (fileName) >= sizeof (task.fileName) ||
+        strlen (targetDirectory) >= sizeof (task.targetDirectory) ||
+        (extraJson != NULL && strlen (extraJson) >= sizeof (task.extraJson))) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
     memset (&task, 0, sizeof (task));
     now = task_manager_now ();
     c_mutex_lock (&manager->mutex);
@@ -242,9 +246,9 @@ int task_manager_delete (TaskManager* manager, const char* uuid)
             while (task_manager_active (manager, uuid))
                 c_cond_wait (&manager->idle, &manager->mutex);
         }
-        result = database_delete (manager->database, uuid);
-        if (result == 0 && task.tempPath[0] != '\0' && unlink (task.tempPath) != 0 && errno != ENOENT)
-            result = -1;
+        result = filesystem_remove_partial (&task);
+        if (result == 0)
+            result = database_delete (manager->database, uuid);
     }
     {
         int savedErrno = errno;
@@ -264,6 +268,11 @@ int task_manager_start (TaskManager* manager, const char* uuid)
         return -1;
     }
     c_mutex_lock (&manager->mutex);
+    if (manager->stopping) {
+        c_mutex_unlock (&manager->mutex);
+        errno = ESHUTDOWN;
+        return -1;
+    }
     if (task_manager_active (manager, uuid)) {
         c_mutex_unlock (&manager->mutex);
         errno = EBUSY;
@@ -303,7 +312,16 @@ typedef struct
     DownloadTask* task;
     ProtocolTask* context;
     const ProtocolOps* ops;
+    int errorCode;
+    char errorMessage[DOWNLOAD_TASK_ERROR_SIZE];
 } DownloadExecution;
+
+static void task_manager_failed (void* userData, int code, const char* message)
+{
+    DownloadExecution* execution = userData;
+    execution->errorCode = code;
+    snprintf (execution->errorMessage, sizeof (execution->errorMessage), "%s", message == NULL ? "" : message);
+}
 
 static void task_manager_progress (void* userData, uint64_t total, uint64_t downloaded, uint64_t speed)
 {
@@ -314,13 +332,13 @@ static void task_manager_progress (void* userData, uint64_t total, uint64_t down
         execution->ops->cancel (execution->context);
     } else if (current.state == DOWNLOAD_TASK_STATE_CANCELLED) {
         execution->ops->cancel (execution->context);
-    } else if (current.state == DOWNLOAD_TASK_STATE_PAUSED) {
+    } else if (current.state == DOWNLOAD_TASK_STATE_PAUSED || execution->manager->stopping) {
         execution->ops->pause (execution->context);
     } else {
         current.totalBytes = total;
         current.downloadedBytes = downloaded;
         current.speedBytesSec = speed;
-        current.progress = total == 0 ? 0 : 100.0 * downloaded / total;
+        current.progress = total == 0 ? 0 : 100.0 * (downloaded > total ? total : downloaded) / total;
         current.updatedAt = task_manager_now ();
         if (database_update (execution->manager->database, &current) != 0)
             execution->ops->cancel (execution->context);
@@ -354,11 +372,13 @@ static void task_manager_filename (void* userData, const char* name)
 int task_manager_execute (TaskManager* manager, DownloadTask* task)
 {
     DownloadExecution execution = { .manager = manager, .task = task };
-    ProtocolCallbacks callbacks = { .onProgress = task_manager_progress, .onFileName = task_manager_filename };
+    ProtocolCallbacks callbacks = { .onProgress = task_manager_progress, .onFileName = task_manager_filename,
+                                    .onFailed = task_manager_failed };
     DownloadTask current;
     struct stat status;
     int result = -1;
     int savedErrno;
+    bool publishedWarning = false;
     c_mutex_lock (&manager->mutex);
     if (database_load (manager->database, task->uuid, &current) != 0 || current.state != DOWNLOAD_TASK_STATE_QUEUED) {
         task_manager_release (manager, task);
@@ -366,9 +386,12 @@ int task_manager_execute (TaskManager* manager, DownloadTask* task)
         return -1;
     }
     *task = current;
-    task->downloadedBytes = stat (task->tempPath, &status) == 0 ? (uint64_t)status.st_size : 0;
+    if (stat (task->tempPath, &status) == 0 && S_ISREG (status.st_mode))
+        task->downloadedBytes = (uint64_t)status.st_size;
     task->state = DOWNLOAD_TASK_STATE_DOWNLOADING;
     task->startedAt = task_manager_now ();
+    task->errorCode = 0;
+    task->errorMessage[0] = '\0';
     result = database_update (manager->database, task);
     c_mutex_unlock (&manager->mutex);
     execution.ops = protocol_find (task->resourceUrl, task->protocol);
@@ -384,19 +407,35 @@ int task_manager_execute (TaskManager* manager, DownloadTask* task)
     savedErrno = errno;
     c_mutex_lock (&manager->mutex);
     if (database_load (manager->database, task->uuid, &current) == 0) {
-        if (stat (task->tempPath, &status) == 0)
+        if (stat (task->tempPath, &status) == 0 && S_ISREG (status.st_mode))
             current.downloadedBytes = (uint64_t)status.st_size;
+        if (result == 1 && current.state == DOWNLOAD_TASK_STATE_DOWNLOADING) {
+            current.state = DOWNLOAD_TASK_STATE_PAUSED;
+            current.pausedAt = task_manager_now ();
+        }
         if (current.state != DOWNLOAD_TASK_STATE_PAUSED && current.state != DOWNLOAD_TASK_STATE_CANCELLED) {
             if (result == 0) {
                 result = filesystem_commit (task);
                 savedErrno = errno;
+                if (result == 1) {
+                    publishedWarning = true;
+                    result = 0;
+                }
             }
             current.state = result == 0 ? DOWNLOAD_TASK_STATE_COMPLETED : DOWNLOAD_TASK_STATE_FAILED;
-            current.errorCode = result == 0 ? 0 : savedErrno;
-            snprintf (current.errorMessage, sizeof (current.errorMessage), "%s", result == 0 ? "" : strerror (savedErrno));
+            current.errorCode = result == 0 ? 0 : (savedErrno == 0 ? EIO : savedErrno);
+            snprintf (current.errorMessage, sizeof (current.errorMessage), "%s", result == 0 ? "" :
+                      (execution.errorMessage[0] ? execution.errorMessage : strerror (current.errorCode)));
+            if (publishedWarning) {
+                current.errorCode = savedErrno;
+                snprintf (current.errorMessage, sizeof (current.errorMessage),
+                          "Output published; parent directory sync failed: %s", strerror (savedErrno));
+            }
             if (result == 0) {
                 current.completedAt = task_manager_now ();
                 current.progress = 100;
+                if (current.totalBytes == 0)
+                    current.totalBytes = current.downloadedBytes;
             }
         }
         current.speedBytesSec = 0;
@@ -405,6 +444,24 @@ int task_manager_execute (TaskManager* manager, DownloadTask* task)
     task_manager_release (manager, task);
     c_mutex_unlock (&manager->mutex);
     return result;
+}
+
+int task_manager_stop (TaskManager* manager)
+{
+    int savedErrno = 0;
+    if (manager == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    c_mutex_lock (&manager->mutex);
+    manager->stopping = true;
+    for (ActiveTask* active = manager->active; active != NULL; active = active->next) {
+        if (task_manager_update_state (manager, active->task.uuid, DOWNLOAD_TASK_STATE_PAUSED) != 0)
+            savedErrno = errno;
+    }
+    c_mutex_unlock (&manager->mutex);
+    errno = savedErrno;
+    return savedErrno == 0 ? 0 : -1;
 }
 
 int task_manager_pause (TaskManager* manager, const char* uuid)

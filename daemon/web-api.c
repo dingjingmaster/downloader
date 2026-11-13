@@ -6,6 +6,7 @@
 #include <clib/string-util.h>
 #include <clib/directory.h>
 #include <clib/path.h>
+#include <clib/utf8.h>
 #include <sys/stat.h>
 
 #include <errno.h>
@@ -55,6 +56,7 @@ static int web_api_append (char* buffer, size_t capacity, size_t* offset, const 
 static int web_api_append_json_string (char* buffer, size_t capacity, size_t* offset, const char* value)
 {
     const unsigned char* text = (const unsigned char*)(value == NULL ? "" : value);
+    bool validUtf8 = c_utf8_validate (c_string_view_from_cstr ((const char*)text));
 
     if (web_api_append (buffer, capacity, offset, "\"") != 0)
         return -1;
@@ -81,7 +83,7 @@ static int web_api_append_json_string (char* buffer, size_t capacity, size_t* of
                 return -1;
             break;
         default:
-            if (*text < 0x20U || *text > 0x7eU) {
+            if (*text < 0x20U || (!validUtf8 && *text > 0x7eU)) {
                 if (web_api_append (buffer, capacity, offset, "\\u%04x", *text) != 0)
                     return -1;
             } else if (web_api_append (buffer, capacity, offset, "%c", *text) != 0) {
@@ -108,6 +110,8 @@ static int web_api_append_task (char* buffer, size_t capacity, size_t* offset, c
         web_api_append_json_string (buffer, capacity, offset, task->protocol) != 0 ||
         web_api_append (buffer, capacity, offset, ",\"state\":") != 0 ||
         web_api_append_json_string (buffer, capacity, offset, download_task_state_name (task->state)) != 0 ||
+        web_api_append (buffer, capacity, offset, ",\"error_message\":") != 0 ||
+        web_api_append_json_string (buffer, capacity, offset, task->errorMessage) != 0 ||
         web_api_append (buffer, capacity, offset,
                         ",\"total_bytes\":%llu,\"downloaded_bytes\":%llu,\"progress\":%.3f,"
                         "\"speed_bytes_sec\":%llu,\"created_at\":%lld,\"completed_at\":%lld}",

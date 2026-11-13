@@ -32,6 +32,17 @@
 #endif
 
 extern const ProtocolOps* http_protocol_ops (void);
+extern const ProtocolOps* aria_protocol_ops (void);
+extern const ProtocolOps* media_protocol_ops (void);
+extern const ProtocolOps* smb_protocol_ops (void);
+
+static volatile sig_atomic_t gStopRequested;
+
+static void daemon_signal (int signalNumber)
+{
+    (void)signalNumber;
+    gStopRequested = 1;
+}
 
 typedef struct
 {
@@ -41,7 +52,6 @@ typedef struct
     TaskManager* manager;
     Ipc*       ipc;
     Web*       web;
-    volatile bool stopRequested;
 } Daemon;
 
 static int daemon_run_task (DownloadTask* task, void* userData)
@@ -96,7 +106,7 @@ static int daemon_handle_request (const char* data, size_t dataSize, char* respo
     if (strcmp (operationText, "ping") == 0) {
         result = snprintf (response, responseCapacity, "{\"ok\":true}");
     } else if (strcmp (operationText, "shutdown") == 0) {
-        daemon->stopRequested = true;
+        gStopRequested = 1;
         result = snprintf (response, responseCapacity, "{\"ok\":true}");
     } else if (strcmp (operationText, "create") == 0) {
         char         url[DOWNLOAD_TASK_URL_SIZE];
@@ -199,8 +209,9 @@ int main (int argc, char* argv[])
         config_free (daemon.config);
         return 1;
     }
-    if (protocol_register (http_protocol_ops ()) != 0 && errno != EEXIST) {
-        fprintf (stderr, "downloader: register http protocol failed: %s\n", strerror (errno));
+    if (protocol_register (aria_protocol_ops ()) != 0 || protocol_register (media_protocol_ops ()) != 0 ||
+        protocol_register (smb_protocol_ops ()) != 0 || protocol_register (http_protocol_ops ()) != 0) {
+        fprintf (stderr, "downloader: register protocol failed: %s\n", strerror (errno));
         scheduler_stop (daemon.scheduler);
         database_close (daemon.database);
         config_free (daemon.config);
@@ -225,8 +236,10 @@ int main (int argc, char* argv[])
     if (daemon.ipc == NULL || ipc_start (daemon.ipc) != 0) {
         fprintf (stderr, "downloader: start ipc failed: %s\n", strerror (errno));
         ipc_free (daemon.ipc);
-        task_manager_free (daemon.manager);
+        if (task_manager_stop (daemon.manager) != 0)
+            fprintf (stderr, "downloader: save paused tasks failed: %s\n", strerror (errno));
         scheduler_stop (daemon.scheduler);
+        task_manager_free (daemon.manager);
         database_close (daemon.database);
         config_free (daemon.config);
         return 1;
@@ -243,19 +256,30 @@ int main (int argc, char* argv[])
             web_free (daemon.web);
             ipc_stop (daemon.ipc);
             ipc_free (daemon.ipc);
-            task_manager_free (daemon.manager);
+            if (task_manager_stop (daemon.manager) != 0)
+                fprintf (stderr, "downloader: save paused tasks failed: %s\n", strerror (errno));
             scheduler_stop (daemon.scheduler);
+            task_manager_free (daemon.manager);
             database_close (daemon.database);
             config_free (daemon.config);
             return 1;
         }
     }
 
-    while (!daemon.stopRequested) {
+    struct sigaction action;
+    memset (&action, 0, sizeof (action));
+    action.sa_handler = daemon_signal;
+    sigemptyset (&action.sa_mask);
+    if (sigaction (SIGINT, &action, NULL) != 0 || sigaction (SIGTERM, &action, NULL) != 0)
+        gStopRequested = 1;
+
+    while (!gStopRequested) {
         struct timespec delay = { .tv_sec = 0, .tv_nsec = 100000000L };
         (void)nanosleep (&delay, NULL);
     }
 
+    if (task_manager_stop (daemon.manager) != 0)
+        fprintf (stderr, "downloader: save paused tasks failed: %s\n", strerror (errno));
     ipc_stop (daemon.ipc);
     ipc_free (daemon.ipc);
     web_stop (daemon.web);

@@ -1,9 +1,13 @@
+#define _POSIX_C_SOURCE 200809L
 #include "protocol.h"
 
 #include <clib/memory.h>
 
 #include <curl/curl.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -54,6 +58,35 @@ static int http_progress (void* userData, curl_off_t total, curl_off_t downloade
     return 0;
 }
 
+static FILE* http_open_partial (const DownloadTask* task)
+{
+    struct stat status;
+    int descriptor = open (task->tempPath, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK |
+                            (task->downloadedBytes > 0 ? O_APPEND : 0), 0600);
+    if (descriptor < 0)
+        return NULL;
+    int statResult = fstat (descriptor, &status);
+    if (statResult != 0 || !S_ISREG (status.st_mode) || status.st_nlink != 1) {
+        int savedErrno = statResult != 0 ? errno : EINVAL;
+        (void)close (descriptor);
+        errno = savedErrno;
+        return NULL;
+    }
+    if (task->downloadedBytes == 0 && ftruncate (descriptor, 0) != 0) {
+        int savedErrno = errno;
+        (void)close (descriptor);
+        errno = savedErrno;
+        return NULL;
+    }
+    FILE* file = fdopen (descriptor, task->downloadedBytes == 0 ? "wb" : "ab");
+    if (file == NULL) {
+        int savedErrno = errno;
+        (void)close (descriptor);
+        errno = savedErrno;
+    }
+    return file;
+}
+
 static int http_open (ProtocolTask** result, const DownloadTask* task, const ProtocolCallbacks* callbacks,
                       void* userData)
 {
@@ -74,17 +107,18 @@ static int http_open (ProtocolTask** result, const DownloadTask* task, const Pro
     if (context == NULL)
         return -1;
     context->curl = curl_easy_init ();
-    context->file = fopen (task->tempPath, task->downloadedBytes == 0 ? "wb" : "ab");
+    context->file = http_open_partial (task);
     context->callbacks = callbacks;
     context->userData = userData;
     context->initialBytes = task->downloadedBytes;
     if (context->curl == NULL || context->file == NULL) {
+        int savedErrno = errno == 0 ? EIO : errno;
         if (context->curl != NULL)
             curl_easy_cleanup (context->curl);
         if (context->file != NULL)
             (void)fclose (context->file);
         c_free (context);
-        errno = EIO;
+        errno = savedErrno;
         return -1;
     }
     (void)curl_easy_setopt (context->curl, CURLOPT_URL, task->resourceUrl);

@@ -8,6 +8,7 @@ import time
 import urllib.request
 import sys
 import os
+import sqlite3
 
 payload = b'downloader-local-fixture\n' * 8192
 
@@ -71,7 +72,7 @@ with tempfile.TemporaryDirectory() as directory:
             time.sleep(.02)
         assert current['state'] == 'completed', current
         assert (root / 'result.bin').read_bytes() == payload
-        assert not (root / 'result.bin.part').exists()
+        assert not (root / f'.{task["id"]}.part').exists()
         assert current['downloaded_bytes'] == len(payload), current
         print('actual HTTP download and atomic commit: PASS')
         def create(name, endpoint):
@@ -85,7 +86,7 @@ with tempfile.TemporaryDirectory() as directory:
                 time.sleep(.02)
             raise AssertionError(current)
         identifier = create('resume.bin', 'file')
-        (root / 'resume.bin.part').write_bytes(payload[:8192])
+        (root / f'.{identifier}.part').write_bytes(payload[:8192])
         api('/' + identifier + '/start', {})
         assert wait_state(identifier, ['completed', 'failed'])['state'] == 'completed'
         assert (root / 'resume.bin').read_bytes() == payload
@@ -94,9 +95,9 @@ with tempfile.TemporaryDirectory() as directory:
         wait_state(identifier, ['downloading'])
         time.sleep(.1)
         api('/' + identifier + '/pause', {})
-        size = (root / 'pause.bin.part').stat().st_size
+        size = (root / f'.{identifier}.part').stat().st_size
         time.sleep(.1)
-        assert (root / 'pause.bin.part').stat().st_size == size
+        assert (root / f'.{identifier}.part').stat().st_size == size
         api('/' + identifier + '/start', {})
         assert wait_state(identifier, ['completed', 'failed'])['state'] == 'completed'
         assert (root / 'pause.bin').read_bytes() == payload
@@ -106,12 +107,12 @@ with tempfile.TemporaryDirectory() as directory:
         api('/' + identifier + '/start', {})
         wait_state(identifier, ['downloading'])
         api('/' + identifier, method='DELETE')
-        assert not (root / 'delete.bin.part').exists()
+        assert not (root / f'.{identifier}.part').exists()
         assert not (root / 'delete.bin').exists()
         identifier = create('failed.bin', 'interrupt')
         api('/' + identifier + '/start', {})
         assert wait_state(identifier, ['completed', 'failed'])['state'] == 'failed'
-        assert (root / 'failed.bin.part').exists()
+        assert (root / f'.{identifier}.part').exists()
         assert not (root / 'failed.bin').exists()
         print('range resume, pause/resume, active delete, interrupted transfer: PASS')
         task = api('', {'url': f'http://127.0.0.1:{server.server_port}/attachment'})['task']
@@ -124,6 +125,40 @@ with tempfile.TemporaryDirectory() as directory:
         assert current['file_name'] == 'report final.bin', current
         assert (root / 'report final.bin').read_bytes() == payload
         print('URL-only creation, configured directory, Content-Disposition: PASS')
+        for hardlink in (False, True):
+            identifier = create(f'linked-{hardlink}.bin', 'file')
+            sentinel = root / f'sentinel-{hardlink}'
+            sentinel.write_bytes(b'keep-existing-file')
+            partial = root / f'.{identifier}.part'
+            if hardlink:
+                os.link(sentinel, partial)
+            else:
+                partial.symlink_to(sentinel)
+            api('/' + identifier + '/start', {})
+            assert wait_state(identifier, ['completed', 'failed'])['state'] == 'failed'
+            assert sentinel.read_bytes() == b'keep-existing-file'
+            api('/' + identifier, method='DELETE')
+            assert sentinel.read_bytes() == b'keep-existing-file'
+        print('partial symlink/hardlink targets remain untouched: PASS')
+        identifier = create('shutdown.bin', 'slow')
+        api('/' + identifier + '/start', {})
+        wait_state(identifier, ['downloading'])
+        time.sleep(.1)
+        daemon.terminate()
+        assert daemon.wait(timeout=5) == 0
+        with sqlite3.connect(root / 'meta.db') as database:
+            assert database.execute('SELECT state FROM download_tasks WHERE uuid=?', (identifier,)).fetchone() == ('paused',)
+        daemon = subprocess.Popen([sys.argv[1], '--config', str(config)], env=environment)
+        for _ in range(100):
+            try:
+                api('')
+                break
+            except OSError:
+                time.sleep(.02)
+        api('/' + identifier + '/start', {})
+        assert wait_state(identifier, ['completed', 'failed'])['state'] == 'completed'
+        assert (root / 'shutdown.bin').read_bytes() == payload
+        print('graceful daemon shutdown and persisted resume: PASS')
     finally:
         daemon.terminate()
         daemon.wait(timeout=5)

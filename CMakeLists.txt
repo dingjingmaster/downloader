@@ -20,9 +20,14 @@ set(BUILD_TESTING OFF CACHE BOOL "Disable clib tests in downloader" FORCE)
 add_subdirectory(clib EXCLUDE_FROM_ALL)
 add_subdirectory(3thrd)
 
-add_library(download_engines STATIC protocols/engines.cpp)
+add_library(download_engines STATIC protocols/engines.cpp protocols/aria.cpp protocols/media.c protocols/smb.c)
 target_include_directories(download_engines PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/protocols")
+target_include_directories(download_engines PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
 target_link_libraries(download_engines PUBLIC clib::static downloader_aria2 downloader_avformat downloader_smb2)
+find_library(DOWNLOADER_ANL_LIBRARY anl)
+if(DOWNLOADER_ANL_LIBRARY)
+    target_link_libraries(download_engines PUBLIC "${DOWNLOADER_ANL_LIBRARY}")
+endif()
 
 add_executable(downloader
     daemon/main.c
@@ -63,11 +68,38 @@ install(DIRECTORY web/ DESTINATION share/downloader/web)
 option(DOWNLOADER_BUILD_TESTS "Build downloader tests" ON)
 if(DOWNLOADER_BUILD_TESTS)
     enable_testing()
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME downloader_http_transfer COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-download.py" $<TARGET_FILE:downloader>)
+    add_test(NAME downloader_bittorrent_transfer COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-bittorrent.py" $<TARGET_FILE:downloader>)
+    add_test(NAME downloader_aria_adapter COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-aria-adapter.py" "${CMAKE_BINARY_DIR}")
+    set_tests_properties(downloader_http_transfer downloader_bittorrent_transfer PROPERTIES TIMEOUT 180)
+    set_tests_properties(downloader_aria_adapter PROPERTIES TIMEOUT 180)
+    find_program(DOWNLOADER_FIXTURE_SMBD smbd)
+    if(DOWNLOADER_FIXTURE_SMBD)
+        add_test(NAME downloader_smb_transfer COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-smb.py" --build-dir "${CMAKE_BINARY_DIR}"
+            --daemon $<TARGET_FILE:downloader>)
+        set_tests_properties(downloader_smb_transfer PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endif()
+    find_program(DOWNLOADER_FIXTURE_FFMPEG ffmpeg)
+    find_program(DOWNLOADER_FIXTURE_FFPROBE ffprobe)
+    if(DOWNLOADER_FIXTURE_FFMPEG AND DOWNLOADER_FIXTURE_FFPROBE)
+        add_test(NAME downloader_media_transfer COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-media.py" $<TARGET_FILE:downloader>)
+        set_tests_properties(downloader_media_transfer PROPERTIES TIMEOUT 120)
+    endif()
     add_executable(test_engines tests/test-engines.c)
     target_link_libraries(test_engines PRIVATE download_engines)
     add_test(NAME downloader_engines COMMAND test_engines)
     set_tests_properties(downloader_engines PROPERTIES
         ENVIRONMENT "XDG_CONFIG_HOME=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/aria2-config")
+    add_executable(test_media_adapter tests/test-media-adapter.c)
+    target_include_directories(test_media_adapter PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
+    target_link_libraries(test_media_adapter PRIVATE clib::static downloader_avformat)
+    add_test(NAME downloader_media_adapter COMMAND test_media_adapter)
     add_executable(test_config
         tests/test-config.c
         daemon/config.c

@@ -64,7 +64,8 @@ ExternalProject_Add(bundled_aria2
     LOG_DOWNLOAD ON LOG_CONFIGURE ON LOG_BUILD ON LOG_INSTALL ON
 )
 
-# Demux/remux only. No encoders, decoders, filters, devices or command-line tools.
+# Demux/remux only. A small decoder set is needed by stream-info probing (e.g.
+# AAC channel layout and H.264 dimensions); output packets are never re-encoded.
 ExternalProject_Add(bundled_ffmpeg
     SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg"
     DOWNLOAD_COMMAND "" UPDATE_COMMAND ""
@@ -80,7 +81,8 @@ ExternalProject_Add(bundled_ffmpeg
         --enable-protocol=file,http,https,tcp,tls,crypto,udp
         --enable-demuxer=hls,dash,mov,mpegts,aac,mp3,matroska
         --enable-muxer=mp4,matroska,mpegts
-        --enable-parser=aac,h264,hevc,mpegaudio
+        --enable-parser=aac,h264,hevc,mpegaudio,opus,vorbis,vp8,vp9,av1
+        --enable-decoder=aac,h264,hevc,mp3,opus,vorbis,vp8,vp9
         --enable-bsf=aac_adtstoasc,h264_mp4toannexb,hevc_mp4toannexb,extract_extradata
     BUILD_COMMAND "${DOWNLOADER_MAKE}" -j${DOWNLOADER_DEPENDENCY_JOBS}
     INSTALL_COMMAND "${DOWNLOADER_MAKE}" install

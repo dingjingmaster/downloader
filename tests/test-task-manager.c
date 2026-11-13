@@ -54,6 +54,8 @@ static void test_task_lifecycle (const char* databasePath, const char* directory
     errno = 0;
     assert (task_manager_get (manager, task.uuid, &loaded) != 0);
     assert (errno == ENOENT);
+    assert (task_manager_stop (manager) == 0);
+    assert (task_manager_start (manager, task.uuid) != 0 && errno == ESHUTDOWN);
     task_manager_free (manager);
     database_close (database);
 }
@@ -71,6 +73,15 @@ static void test_task_validation (const char* databasePath, const char* director
     assert (task_manager_create (manager, "https://example.test/file.bin", "../file.bin", directory, "https", NULL,
                                  &task) != 0);
     assert (errno == EINVAL);
+    assert (task_manager_create (manager, "https://example.test/video.mpd?token=x", NULL, directory, NULL, NULL,
+                                 &task) == 0);
+    assert (strcmp (task.protocol, "dash") == 0);
+    DownloadTask other;
+    assert (task_manager_create (manager, "https://example.test/video.mpd?token=y", NULL, directory, NULL, NULL,
+                                 &other) == 0);
+    assert (strcmp (task.tempPath, other.tempPath) != 0);
+    assert (task_manager_delete (manager, task.uuid) == 0);
+    assert (task_manager_delete (manager, other.uuid) == 0);
     errno = 0;
     assert (task_manager_create (manager, "", "file.bin", directory, "https", NULL, &task) != 0);
     assert (errno == EINVAL);

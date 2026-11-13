@@ -33,16 +33,18 @@ pkg-config 和 NASM，以及系统开发包：OpenSSL、zlib、Expat、libxml2�
 aria2 的 autoreconf 在构建目录的副本执行，不修改上游子模块。
 更新子模块版本后请使用新构建目录，避免 ExternalProject 复用旧版本的完成标记。
 
-FFmpeg 只编译网络读取、HLS/DASH 等解复用、MP4/Matroska/MPEG-TS 封装及所需
-码流过滤器，不编译转码器和命令行程序。libsmb2 不编译示例或 Kerberos 支持。
+FFmpeg 编译网络读取、HLS/DASH 等解复用、MP4/Matroska/MPEG-TS 封装及所需
+码流过滤器，同时保留探测流参数所需的常见解码器，不编译编码器和命令行程序。
+下载只复制音视频包，不转码。libsmb2 不编译示例或 Kerberos 支持。
 这不是完全静态的可执行文件：上述系统基础库仍是构建及运行依赖。
 
 ## 接入边界
 
-本次建立源码、构建、链接和离线引擎检查入口。已有任务执行仍使用 curl 适配器；
-新引擎尚未注册为 `ProtocolOps`，不能据此声称 Web 中已能下载 BT、Magnet、
-Metalink、SMB、HLS 或 DASH。后续适配需要处理单进程唯一 aria2 Session、
-多文件任务的暂存和提交，以及流媒体暂停恢复，继续通过核心回调报告进度。
+三个引擎已经通过 `protocols/aria.cpp`、`protocols/media.c`、`protocols/smb.c`
+注册统一 `ProtocolOps`。核心负责协议推断、状态、数据库、临时文件清理和原子提交，
+适配器通过回调报告文件名、进度和错误，不直接操作 SQLite 或 IPC。
+aria2 的会话在可取消等待的互斥区中串行运行，满足单进程单 Session 的上游约束。
+具体能力和续传边界见根目录 README。
 
 `downloader_engines` 测试创建和销毁 aria2 Session、SMB 上下文，并检查
 HLS/DASH 输入格式和 MP4 输出格式，完全离线。此测试不替代协议端到端下载测试。

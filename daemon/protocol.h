@@ -2,11 +2,14 @@
 #define DOWNLOADER_PROTOCOL_H
 
 #include "task.h"
+#include <clib/macro.h>
 
 #include <stdbool.h>
 #include <stdint.h>
 
 #define DOWNLOADER_MAX_PROTOCOLS 32U
+
+C_BEGIN_EXTERN_C
 
 typedef struct ProtocolTask ProtocolTask;
 typedef struct ProtocolOps ProtocolOps;
@@ -35,5 +38,9 @@ struct ProtocolOps
 
 int                 protocol_register (const ProtocolOps* ops);
 const ProtocolOps*  protocol_find (const char* url, const char* protocol);
+/* Infer the adapter from the scheme and decoded path, ignoring query/fragment. */
+int                 protocol_detect (const char* url, char* protocol, size_t capacity);
+
+C_END_EXTERN_C
 
 #endif
