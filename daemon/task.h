@@ -1,0 +1,62 @@
+#ifndef DOWNLOADER_TASK_H
+#define DOWNLOADER_TASK_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#define DOWNLOAD_TASK_UUID_SIZE             64U
+#define DOWNLOAD_TASK_FILE_NAME_SIZE        512U
+#define DOWNLOAD_TASK_PATH_SIZE             1024U
+#define DOWNLOAD_TASK_URL_SIZE              4096U
+#define DOWNLOAD_TASK_PROTOCOL_SIZE         32U
+#define DOWNLOAD_TASK_CHECKSUM_SIZE         128U
+#define DOWNLOAD_TASK_HTTP_VALUE_SIZE       512U
+#define DOWNLOAD_TASK_ERROR_SIZE            512U
+#define DOWNLOAD_TASK_EXTRA_JSON_SIZE       4096U
+
+typedef enum
+{
+    DOWNLOAD_TASK_STATE_CREATED,
+    DOWNLOAD_TASK_STATE_QUEUED,
+    DOWNLOAD_TASK_STATE_DOWNLOADING,
+    DOWNLOAD_TASK_STATE_PAUSED,
+    DOWNLOAD_TASK_STATE_COMPLETED,
+    DOWNLOAD_TASK_STATE_FAILED,
+    DOWNLOAD_TASK_STATE_CANCELLED
+} DownloadTaskState;
+
+typedef struct
+{
+    char              uuid[DOWNLOAD_TASK_UUID_SIZE];
+    char              fileName[DOWNLOAD_TASK_FILE_NAME_SIZE];
+    char              targetDirectory[DOWNLOAD_TASK_PATH_SIZE];
+    char              targetPath[DOWNLOAD_TASK_PATH_SIZE];
+    char              tempPath[DOWNLOAD_TASK_PATH_SIZE];
+    char              resourceUrl[DOWNLOAD_TASK_URL_SIZE];
+    char              protocol[DOWNLOAD_TASK_PROTOCOL_SIZE];
+    DownloadTaskState state;
+    int                errorCode;
+    char              errorMessage[DOWNLOAD_TASK_ERROR_SIZE];
+    uint64_t          totalBytes;
+    uint64_t          downloadedBytes;
+    double            progress;
+    uint64_t          speedBytesSec;
+    int64_t           createdAt;
+    int64_t           startedAt;
+    int64_t           pausedAt;
+    int64_t           completedAt;
+    int64_t           updatedAt;
+    int               retryCount;
+    int               maxRetries;
+    char              checksumType[DOWNLOAD_TASK_PROTOCOL_SIZE];
+    char              checksumValue[DOWNLOAD_TASK_CHECKSUM_SIZE];
+    char              etag[DOWNLOAD_TASK_HTTP_VALUE_SIZE];
+    char              lastModified[DOWNLOAD_TASK_HTTP_VALUE_SIZE];
+    char              extraJson[DOWNLOAD_TASK_EXTRA_JSON_SIZE];
+} DownloadTask;
+
+const char*         download_task_state_name (DownloadTaskState state);
+DownloadTaskState   download_task_state_from_name (const char* name);
+int                 download_task_set_state (DownloadTask* task, DownloadTaskState state);
+
+#endif
