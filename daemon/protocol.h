@@ -22,6 +22,10 @@ typedef struct
     void (*onPaused) (void* userData);
     void (*onCompleted) (void* userData);
     void (*onFailed) (void* userData, int errorCode, const char* errorMessage);
+    /* Persist validators before payload writes; -1 requests an abort. */
+    int (*onMetadata) (void* userData, const char* etag, const char* lastModified);
+    /* Scheduled retry starts at 1 (before its backoff); -1 requests an abort. */
+    int (*onRetry) (void* userData, int attempt);
 } ProtocolCallbacks;
 
 struct ProtocolOps

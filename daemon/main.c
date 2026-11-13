@@ -225,7 +225,9 @@ int main (int argc, char* argv[])
         config_free (daemon.config);
         return 1;
     }
-    if (task_manager_set_download_directory (daemon.manager, config_download_dir (daemon.config)) != 0) {
+    if (task_manager_set_download_directory (daemon.manager, config_download_dir (daemon.config)) != 0 ||
+        task_manager_set_transfer_options (daemon.manager, config_max_retries (daemon.config),
+                                          config_connect_timeout (daemon.config), config_transfer_timeout (daemon.config)) != 0) {
         scheduler_stop (daemon.scheduler);
         task_manager_free (daemon.manager);
         database_close (daemon.database);

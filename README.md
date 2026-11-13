@@ -71,3 +71,40 @@ aria2 当前串行运行这些任务，等待期间也能暂停或删除；其�
 本地协议测试通过 `ctest --test-dir build --output-on-failure` 运行。流媒体测试使用系统
 `ffmpeg/ffprobe` 生成和检查 fixture，SMB 测试使用临时目录和高端口启动 `smbd`；
 这些命令只用于测试，downloader 运行不依赖它们。BT 测试自带回环 tracker/peer。
+
+## HTTP 下载可靠性
+
+HTTP/HTTPS 文件下载默认发送下载器的 User-Agent。新建任务中的“HTTP 下载选项”默认折叠，
+可指定 User-Agent 和资源页面 Referer；也可以通过 API 提交：
+
+```json
+{
+  "url": "https://example.org/file.bin",
+  "extra": {
+    "http": {
+      "user_agent": "downloader/0.1.0",
+      "referer": "https://example.org/downloads"
+    }
+  }
+}
+```
+
+`[download] max_retries` 是临时故障后的额外尝试次数，0 表示不重试临时故障。
+HTTP 408、429、500、502、503、504 及临时连接/传输中断按退避策略重试，
+支持 `Retry-After`；401、403、404、证书错误、磁盘写入错误等不会被反复重试。
+等待重试时仍能暂停或删除。界面显示当前重试次数和完整失败原因。
+
+`connect_timeout` 控制 curl 下载的连接阶段；`transfer_timeout` 控制本次执行的总时长，
+包含各次尝试和退避等待，0 表示不设置总时限。这两个选项目前用于 curl 适配器，
+并不改变 BT、SMB 或流媒体引擎各自的超时策略。
+
+HTTP 续传保存并使用强 ETag 或 Last-Modified，通过 `If-Range` 和 `Content-Range`
+确认文件及偏移。资源改变、服务器忽略 Range 或偏移失效时会安全重新下载。
+旧任务没有保存这些校验信息时，也会从头下载，避免把两个不同版本拼成一个文件。
+错误的部分响应不会被当成完整文件发布；重定向仅允许 HTTP(S)，最多 10 次。
+416 偏移失效允许一次从头恢复，不占用临时故障重试次数。
+经过重定向的响应不保存续传校验信息，下次执行会从头下载；已有部分文件在续传时
+遇到重定向也会从头恢复，避免不同地址恰好使用相同 ETag 时拼接错误内容。
+
+登录权限、已过期的临时签名链接和服务器访问策略仍需对应的有效凭据或新链接。
+新增的通用重试不会绕过这些限制，也不会关闭 TLS 证书验证。

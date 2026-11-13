@@ -114,9 +114,10 @@ static int web_api_append_task (char* buffer, size_t capacity, size_t* offset, c
         web_api_append_json_string (buffer, capacity, offset, task->errorMessage) != 0 ||
         web_api_append (buffer, capacity, offset,
                         ",\"total_bytes\":%llu,\"downloaded_bytes\":%llu,\"progress\":%.3f,"
-                        "\"speed_bytes_sec\":%llu,\"created_at\":%lld,\"completed_at\":%lld}",
+                        "\"speed_bytes_sec\":%llu,\"retry_count\":%d,\"max_retries\":%d,\"created_at\":%lld,\"completed_at\":%lld}",
                         (unsigned long long)task->totalBytes, (unsigned long long)task->downloadedBytes, task->progress,
-                        (unsigned long long)task->speedBytesSec, (long long)task->createdAt, (long long)task->completedAt) != 0)
+                        (unsigned long long)task->speedBytesSec, task->retryCount, task->maxRetries,
+                        (long long)task->createdAt, (long long)task->completedAt) != 0)
         return -1;
     return 0;
 }

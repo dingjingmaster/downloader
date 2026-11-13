@@ -35,7 +35,24 @@ struct TaskManager
     CCond idle;
     char defaultDirectory[DOWNLOAD_TASK_PATH_SIZE];
     bool stopping;
+    int maxRetries;
+    int connectTimeout;
+    int transferTimeout;
 };
+
+int task_manager_set_transfer_options (TaskManager* manager, int maxRetries, int connectTimeout, int transferTimeout)
+{
+    if (manager == NULL || maxRetries < 0 || connectTimeout < 0 || transferTimeout < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    c_mutex_lock (&manager->mutex);
+    manager->maxRetries = maxRetries;
+    manager->connectTimeout = connectTimeout;
+    manager->transferTimeout = transferTimeout;
+    c_mutex_unlock (&manager->mutex);
+    return 0;
+}
 
 int task_manager_set_download_directory (TaskManager* manager, const char* directory)
 {
@@ -129,6 +146,8 @@ TaskManager* task_manager_new (Database* database, Scheduler* scheduler)
         return NULL;
     }
     manager->database = database;
+    manager->maxRetries = 3;
+    manager->connectTimeout = 30;
     strcpy (manager->defaultDirectory, ".");
     if (!c_cond_init (&manager->idle)) {
         c_mutex_clear (&manager->mutex);
@@ -213,7 +232,7 @@ int task_manager_create (TaskManager* manager, const char* resourceUrl, const ch
     task.state = DOWNLOAD_TASK_STATE_CREATED;
     task.createdAt = now;
     task.updatedAt = now;
-    task.maxRetries = 3;
+    task.maxRetries = manager->maxRetries;
     if (filesystem_prepare (&task) != 0 || database_insert (manager->database, &task) != 0) {
         int savedErrno = errno;
         c_mutex_unlock (&manager->mutex);
@@ -323,6 +342,71 @@ static void task_manager_failed (void* userData, int code, const char* message)
     snprintf (execution->errorMessage, sizeof (execution->errorMessage), "%s", message == NULL ? "" : message);
 }
 
+/* Caller holds manager->mutex. Control remains on the protocol worker thread. */
+static int task_manager_callback_task (DownloadExecution* execution, DownloadTask* current)
+{
+    if (database_load (execution->manager->database, execution->task->uuid, current) != 0) {
+        execution->ops->cancel (execution->context);
+        return -1;
+    }
+    if (current->state == DOWNLOAD_TASK_STATE_CANCELLED) {
+        execution->ops->cancel (execution->context);
+    } else if (current->state == DOWNLOAD_TASK_STATE_PAUSED || execution->manager->stopping) {
+        execution->ops->pause (execution->context);
+    } else {
+        return 0;
+    }
+    errno = ECANCELED;
+    return -1;
+}
+
+static int task_manager_metadata (void* userData, const char* etag, const char* lastModified)
+{
+    DownloadExecution* execution = userData;
+    DownloadTask current;
+    int result;
+    if (etag == NULL || lastModified == NULL || strlen (etag) >= sizeof (current.etag) ||
+        strlen (lastModified) >= sizeof (current.lastModified)) {
+        errno = EINVAL;
+        return -1;
+    }
+    c_mutex_lock (&execution->manager->mutex);
+    result = task_manager_callback_task (execution, &current);
+    if (result == 0) {
+        snprintf (current.etag, sizeof (current.etag), "%s", etag);
+        snprintf (current.lastModified, sizeof (current.lastModified), "%s", lastModified);
+        current.updatedAt = task_manager_now ();
+        result = database_update (execution->manager->database, &current);
+    }
+    int savedErrno = errno;
+    c_mutex_unlock (&execution->manager->mutex);
+    errno = savedErrno;
+    return result;
+}
+
+static int task_manager_retry (void* userData, int attempt)
+{
+    DownloadExecution* execution = userData;
+    DownloadTask current;
+    int result;
+    if (attempt <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    c_mutex_lock (&execution->manager->mutex);
+    result = task_manager_callback_task (execution, &current);
+    if (result == 0) {
+        current.retryCount = attempt;
+        current.speedBytesSec = 0;
+        current.updatedAt = task_manager_now ();
+        result = database_update (execution->manager->database, &current);
+    }
+    int savedErrno = errno;
+    c_mutex_unlock (&execution->manager->mutex);
+    errno = savedErrno;
+    return result;
+}
+
 static void task_manager_progress (void* userData, uint64_t total, uint64_t downloaded, uint64_t speed)
 {
     DownloadExecution* execution = userData;
@@ -373,7 +457,8 @@ int task_manager_execute (TaskManager* manager, DownloadTask* task)
 {
     DownloadExecution execution = { .manager = manager, .task = task };
     ProtocolCallbacks callbacks = { .onProgress = task_manager_progress, .onFileName = task_manager_filename,
-                                    .onFailed = task_manager_failed };
+                                    .onFailed = task_manager_failed, .onMetadata = task_manager_metadata,
+                                    .onRetry = task_manager_retry };
     DownloadTask current;
     struct stat status;
     int result = -1;
@@ -386,6 +471,10 @@ int task_manager_execute (TaskManager* manager, DownloadTask* task)
         return -1;
     }
     *task = current;
+    task->maxRetries = manager->maxRetries;
+    task->connectTimeout = manager->connectTimeout;
+    task->transferTimeout = manager->transferTimeout;
+    task->retryCount = 0;
     if (stat (task->tempPath, &status) == 0 && S_ISREG (status.st_mode))
         task->downloadedBytes = (uint64_t)status.st_size;
     task->state = DOWNLOAD_TASK_STATE_DOWNLOADING;

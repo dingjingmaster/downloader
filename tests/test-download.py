@@ -51,7 +51,7 @@ with tempfile.TemporaryDirectory() as directory:
         probe.bind(('127.0.0.1', 0))
         port = probe.getsockname()[1]
     config = root / 'download.ini'
-    config.write_text(f'[daemon]\nipc_socket={root}/ipc.sock\n[download]\ndatabase={root}/meta.db\ndownload_dir={root}\n[web]\nlisten=127.0.0.1\nport={port}\n')
+    config.write_text(f'[daemon]\nipc_socket={root}/ipc.sock\n[download]\ndatabase={root}/meta.db\ndownload_dir={root}\nmax_retries=0\n[web]\nlisten=127.0.0.1\nport={port}\n')
     environment = dict(os.environ, no_proxy='127.0.0.1', NO_PROXY='127.0.0.1')
     daemon = subprocess.Popen([sys.argv[1], '--config', str(config)], env=environment)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))

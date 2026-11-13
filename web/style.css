@@ -14,6 +14,8 @@ button.primary:hover { background: #1d4ed8; }
 button:disabled { opacity: .45; cursor: not-allowed; }
 button:focus-visible, input:focus-visible { outline: 3px solid #93b8ff; outline-offset: 3px; }
 #summary { color: #748198; font-size: 13px; }
+#action-error { margin: 0; padding: 12px 24px; color: #b54450; background: #fff5f5; border: 1px solid #efd5d8; }
+#action-error:empty { display: none; }
 .table-scroll { overflow-x: auto; background: white; border: 1px solid #e3e9f2; }
 table { width: 100%; border-collapse: collapse; min-width: 850px; font-size: 13px; }
 th { padding: 14px 20px; text-align: left; background: #f8fafd; color: #7b879b; font-weight: 500; font-size: 12px; white-space: nowrap; }
@@ -23,6 +25,10 @@ td:first-child { max-width: 340px; overflow: hidden; text-overflow: ellipsis; wh
 td:nth-child(2) { text-transform: uppercase; color: #748198; font-size: 11px; }
 td:nth-child(4), td:nth-child(5) { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .task-actions { gap: 6px; }
+.task-note { margin-top: 5px; color: #748198; font-size: 12px; }
+.task-error { margin-top: 5px; max-width: 300px; overflow-wrap: anywhere; color: #b54450; font-size: 12px; }
+.request-options summary { cursor: pointer; color: #748198; font-size: 13px; }
+.request-options label { display: block; margin-top: 14px; }
 .task-actions button { padding: 6px 10px; font-size: 12px; }
 button[data-action="delete"] { color: #c64e59; }
 button[data-action="delete"]:hover { background: #fff1f2; border-color: #efbbc1; }

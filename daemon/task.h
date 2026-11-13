@@ -53,6 +53,9 @@ typedef struct
     char              etag[DOWNLOAD_TASK_HTTP_VALUE_SIZE];
     char              lastModified[DOWNLOAD_TASK_HTTP_VALUE_SIZE];
     char              extraJson[DOWNLOAD_TASK_EXTRA_JSON_SIZE];
+    /* Runtime policy supplied by the manager; not additional database columns. */
+    int               connectTimeout;
+    int               transferTimeout;
 } DownloadTask;
 
 const char*         download_task_state_name (DownloadTaskState state);

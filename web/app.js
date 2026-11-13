@@ -43,7 +43,10 @@
     const rows = body.tasks.map((task) => `<tr>
       <td title="${escapeHtml(task.resource_url)}">${escapeHtml(task.file_name)}</td>
       <td>${escapeHtml(task.protocol)}</td>
-      <td title="${escapeHtml(task.error_message || '')}">${escapeHtml(stateLabels.get(task.state) || "未知状态")}${task.state === 'completed' && task.error_message ? '（同步警告）' : ''}</td>
+      <td>${escapeHtml(stateLabels.get(task.state) || "未知状态")}${task.state === 'completed' && task.error_message ? '（同步警告）' : ''}
+        ${task.retry_count ? `<div class="task-note">重试 ${Number(task.retry_count)} / ${Number(task.max_retries)}</div>` : ''}
+        ${task.error_message ? `<div class="task-error">${escapeHtml(task.error_message)}</div>` : ''}
+      </td>
       <td>${task.total_bytes || task.state === 'completed' ? Number(task.progress).toFixed(1) + '%' : '—'}</td>
       <td>${formatBytes(task.downloaded_bytes)} / ${task.total_bytes ? formatBytes(task.total_bytes) : '未知'}</td>
       <td><div class="task-actions">
@@ -132,6 +135,12 @@
     const values = Object.fromEntries(new FormData(event.target));
     values.url = values.url.trim();
     values.target_directory = values.target_directory.trim();
+    const http = {};
+    if ((values.http_user_agent || '').trim()) http.user_agent = values.http_user_agent.trim();
+    if ((values.http_referer || '').trim()) http.referer = values.http_referer.trim();
+    delete values.http_user_agent;
+    delete values.http_referer;
+    if (Object.keys(http).length) values.extra = { http };
     const submit = event.target.querySelector('[type="submit"]');
     submit.disabled = true;
     try {
@@ -147,8 +156,17 @@
     }
   });
   document.querySelector("#clear-completed").addEventListener("click", async () => {
-    await request("/api/tasks/clear-completed", { method: "POST" });
-    load();
+    const button = document.querySelector("#clear-completed");
+    button.disabled = true;
+    document.querySelector("#action-error").textContent = '';
+    try {
+      await request("/api/tasks/clear-completed", { method: "POST" });
+      await load();
+    } catch (error) {
+      document.querySelector("#action-error").textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
   });
   document.querySelector("#previous").addEventListener("click", () => { if (page > 1) { page -= 1; load(); } });
   document.querySelector("#next").addEventListener("click", () => { if (page < pages) { page += 1; load(); } });
@@ -157,8 +175,16 @@
     if (!button) return;
     const action = button.dataset.action;
     const id = encodeURIComponent(button.dataset.id);
-    await request(action === "delete" ? `/api/tasks/${id}` : `/api/tasks/${id}/${action}`, { method: action === "delete" ? "DELETE" : "POST" });
-    load();
+    button.disabled = true;
+    document.querySelector("#action-error").textContent = '';
+    try {
+      await request(action === "delete" ? `/api/tasks/${id}` : `/api/tasks/${id}/${action}`, { method: action === "delete" ? "DELETE" : "POST" });
+      await load();
+    } catch (error) {
+      document.querySelector("#action-error").textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
   });
   load();
   setInterval(load, 2000);

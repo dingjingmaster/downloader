@@ -11,6 +11,7 @@ C_BEGIN_EXTERN_C
 
 typedef struct TaskManager TaskManager;
 int task_manager_set_download_directory (TaskManager* manager, const char* directory);
+int task_manager_set_transfer_options (TaskManager* manager, int maxRetries, int connectTimeout, int transferTimeout);
 const char* task_manager_download_directory (const TaskManager* manager);
 int task_manager_execute (TaskManager* manager, DownloadTask* task);
 

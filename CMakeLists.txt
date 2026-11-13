@@ -71,6 +71,9 @@ if(DOWNLOADER_BUILD_TESTS)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME downloader_http_transfer COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-download.py" $<TARGET_FILE:downloader>)
+    add_test(NAME downloader_http_resilience COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-http-resilience.py" $<TARGET_FILE:downloader>)
+    set_tests_properties(downloader_http_resilience PROPERTIES TIMEOUT 150)
     add_test(NAME downloader_bittorrent_transfer COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-bittorrent.py" $<TARGET_FILE:downloader>)
     add_test(NAME downloader_aria_adapter COMMAND "${Python3_EXECUTABLE}" -B

@@ -2,6 +2,7 @@
 
 #include "database.h"
 #include "task-manager.h"
+#include "protocol.h"
 
 #include <clib/memory.h>
 
@@ -11,6 +12,75 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+struct ProtocolTask
+{
+    DownloadTask source;
+    ProtocolCallbacks callbacks;
+    void* userData;
+};
+
+static bool fixture_can_handle (const char* url, const char* protocol)
+{
+    (void)url;
+    return strcmp (protocol, "https") == 0;
+}
+
+static int fixture_open (ProtocolTask** result, const DownloadTask* source, const ProtocolCallbacks* callbacks, void* userData)
+{
+    *result = c_malloc0 (sizeof (**result));
+    assert (*result != NULL);
+    (*result)->source = *source;
+    (*result)->callbacks = *callbacks;
+    (*result)->userData = userData;
+    return 0;
+}
+
+static int fixture_run (ProtocolTask* task)
+{
+    assert (task->source.maxRetries == 2 && task->source.connectTimeout == 7 && task->source.transferTimeout == 11);
+    assert (task->callbacks.onMetadata (task->userData, "\"fixture-v1\"", "Wed, 21 Oct 2015 07:28:00 GMT") == 0);
+    assert (task->callbacks.onRetry (task->userData, 1) == 0);
+    FILE* file = fopen (task->source.tempPath, "wb");
+    assert (file != NULL && fputs ("data", file) >= 0 && fclose (file) == 0);
+    task->callbacks.onProgress (task->userData, 4, 4, 0);
+    return 0;
+}
+
+static void fixture_close (ProtocolTask* task)
+{
+    c_free (task);
+}
+
+static void test_transfer_policy (const char* databasePath, const char* directory)
+{
+    static const ProtocolOps ops = {.name = "fixture", .canHandle = fixture_can_handle,
+        .open = fixture_open, .run = fixture_run, .close = fixture_close};
+    Database* database;
+    assert (protocol_register (&ops) == 0);
+    assert (database_open (databasePath, &database) == 0);
+    TaskManager* manager = task_manager_new (database, NULL);
+    assert (manager != NULL);
+    assert (task_manager_set_transfer_options (manager, -1, 0, 0) == -1 && errno == EINVAL);
+    assert (task_manager_set_transfer_options (manager, 2, 7, 11) == 0);
+    DownloadTask task;
+    assert (task_manager_create (manager, "https://fixture.invalid/data.bin", NULL, directory, NULL, NULL, &task) == 0);
+    assert (task.maxRetries == 2);
+    assert (task_manager_start (manager, task.uuid) == 0);
+    /* Execute takes ownership, just as the scheduler worker does. */
+    DownloadTask* owned = c_malloc (sizeof (*owned));
+    assert (owned != NULL);
+    *owned = task;
+    assert (task_manager_execute (manager, owned) == 0);
+    assert (task_manager_get (manager, task.uuid, &task) == 0);
+    assert (task.state == DOWNLOAD_TASK_STATE_COMPLETED && task.retryCount == 1);
+    assert (strcmp (task.etag, "\"fixture-v1\"") == 0);
+    assert (strcmp (task.lastModified, "Wed, 21 Oct 2015 07:28:00 GMT") == 0);
+    assert (unlink (task.targetPath) == 0);
+    assert (task_manager_delete (manager, task.uuid) == 0);
+    task_manager_free (manager);
+    database_close (database);
+}
 
 static void test_task_lifecycle (const char* databasePath, const char* directory)
 {
@@ -104,6 +174,7 @@ int main (void)
     assert (createdDirectory != NULL);
     test_task_lifecycle (databasePath, createdDirectory);
     test_task_validation (databasePath, createdDirectory);
+    test_transfer_policy (databasePath, createdDirectory);
     assert (unlink (databasePath) == 0);
     return 0;
 }
