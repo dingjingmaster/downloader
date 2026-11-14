@@ -55,3 +55,23 @@ HLS/DASH 输入格式和 MP4 输出格式，完全离线。此测试不替代协
 本配置的 FFmpeg 为 LGPL-2.1-or-later，libsmb2 库为 LGPL-2.1-or-later。
 发行时需要履行实际组合软件的许可义务，不能把静态链接的 aria2 当作独立外部程序。
 安装会同时将上游许可文件放入 `share/licenses/downloader/`。
+
+## 本地补丁
+
+- libsmb2 `lib/krb5-wrapper.c`：构造 Kerberos 服务主体名时去掉 `host[:port]` 中的端口
+  （SPN 本身与端口无关），使自定义 SMB 端口的本地 Kerberos 测试可用。
+- libsmb2 公开 `smb2_set_use_cached_creds()`（`lib/init.c`、`include/smb2/libsmb2.h`）：
+  允许调用方使用 `user/password` 获取票据到隔离的 MEMORY ccache（libsmb2 内部路径名为
+  cached creds），避免读取进程级票据缓存。
+补丁只影响 GSSAPI 路径，不改变 SMB2/3 协商或 NTLMSSP 路径。
+
+## Kerberos 与 SMB1 依赖
+
+- libsmb2 现在启用 `LibKrb5`/`GSSAPI`（`3thrd/CMakeLists.txt`），构建机需要 MIT
+  Kerberos 开发包；下载器链接 `libkrb5` 与 `libgssapi_krb5`。
+- `protocols/smb1.c` 链接**系统**的 Samba `libsmbclient`（pkg-config `smbclient`），
+  不是本目录的固定源码。libsmbclient 采用 GPLv3；分发含该后端的二进制前必须确认
+  许可证兼容性。libsmb2 仍为 LGPL-2.1。
+- 两处 libsmb2 本地补丁保存在 `patches/libsmb2-krb5.patch`，由 `apply-patches.sh`
+  在 ExternalProject 配置前幂等应用；升级 libsmb2 时若补丁冲突需重新生成，并运行
+  Kerberos/SMB1 测试。

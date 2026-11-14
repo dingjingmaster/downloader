@@ -302,12 +302,15 @@ def main():
         harness = fixture / "adapter.c"
         harness.write_text(HARNESS)
         binary = fixture / "adapter"
+        krb5 = subprocess.run(["pkg-config", "--libs", "krb5"], capture_output=True, text=True)
         command = ["cc", "-std=c99", "-Wall", "-Wextra", "-Werror", "-g",
                    "-I" + str(root / "protocols"), "-I" + str(root / "daemon"),
                    "-I" + str(build / "clib/include"),
                    "-I" + str(root / "3thrd/libsmb2/include"),
                    str(harness), str(root / "protocols/smb.c"), str(clib), str(smb),
                    "-pthread", "-lanl", "-o", str(binary)]
+        command[command.index("-o"):command.index("-o")] = (
+            krb5.stdout.split() if krb5.returncode == 0 else []) + ["-lgssapi_krb5"]
         if args.sanitize:
             command[1:1] = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
         subprocess.run(command, check=True)
@@ -360,21 +363,45 @@ guest ok = no
         passdb = fixture / "private/smbpasswd"
         passdb.write_text(f"{user}:{os.getuid()}:" + "X" * 32 + f":{nt_hash}:[U          ]:LCT-{int(time.time()):08X}:\n")
         passdb.chmod(0o600)
-        output = open(fixture / "smbd.log", "w+")
-        server = subprocess.Popen(["smbd", "-F", "--no-process-group", "-s", str(config)],
-                                  stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
-        try:
-            for _ in range(100):
+        # The system log directory is root-only on some hosts; keep smbd's
+        # bootstrap logging on the fixture's stdout instead. A transient
+        # startup failure is retried before giving up.
+        server = None
+        output = None
+        failure = ""
+        for attempt in range(3):
+            output = open(fixture / f"smbd-{attempt}.log", "w+")
+            server = subprocess.Popen(["smbd", "-F", "--no-process-group", "--debug-stdout",
+                                       "-s", str(config)],
+                                      stdin=subprocess.DEVNULL, stdout=output,
+                                      stderr=subprocess.STDOUT, start_new_session=True)
+            ready = False
+            started = time.monotonic()
+            while time.monotonic() - started < 5:
                 try:
                     with socket.create_connection(("127.0.0.1", port), timeout=.1):
+                        ready = True
                         break
                 except OSError:
-                    if server.poll() is not None:
-                        output.seek(0)
-                        raise RuntimeError("fixture smbd exited: " + output.read())
+                    # smbd may let the initial -F process exit while a child
+                    # is still binding the port; allow a short grace period.
+                    if server.poll() is not None and time.monotonic() - started >= 2:
+                        break
                     time.sleep(.05)
-            else:
-                raise RuntimeError("fixture smbd did not listen")
+            if ready:
+                break
+            output.seek(0)
+            failure = output.read()
+            output.close()
+            try:
+                os.killpg(server.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            server.wait(timeout=5)
+            server = None
+        if server is None:
+            raise RuntimeError("fixture smbd failed to start after retries: " + failure)
+        try:
             base = f"smb://{quote(user)}:{quote(password, safe='')}@127.0.0.1:{port}"
             target = fixture / "result.part"
             count = 0

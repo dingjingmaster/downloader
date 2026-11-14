@@ -32,6 +32,8 @@ PAYLOAD = bytes(range(256)) * 257 + b'end-of-resilience-fixture'
 PREFIX = PAYLOAD[:8192]
 ETAG = '"fixture-v1"'
 MODIFIED = 'Wed, 21 Oct 2015 07:28:00 GMT'
+CHECKPOINT_INTERVAL = 1024 * 1024
+CRASH_PAYLOAD = bytes(range(256)) * 32768
 BINARY = None
 
 
@@ -39,6 +41,7 @@ class Route:
     def __init__(self, kind, **options):
         self.kind = kind
         self.options = options
+        self.url = None
         self.requests = []
         self.lock = threading.Lock()
         self.responded = threading.Event()
@@ -147,6 +150,17 @@ class Fixture(http.server.BaseHTTPRequestHandler):
                 route.release.wait(5)
                 self.wfile.write(body[8192:])
                 return
+            if kind == 'slowrange':
+                self.send_response(status)
+                for key, value in headers.items():
+                    self.send_header(key, value)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                for index in range(0, len(body), 65536):
+                    self.wfile.write(body[index:index + 65536])
+                    self.wfile.flush()
+                    time.sleep(.02)
+                return
             if kind == 'drop' and attempt <= options.get('failures', 1):
                 self.send_response(status)
                 for key, value in headers.items():
@@ -246,6 +260,22 @@ class Daemon:
             return dict(database.execute('SELECT * FROM download_tasks WHERE uuid=?',
                                          (identifier,)).fetchone())
 
+    def checkpoint(self, identifier):
+        with sqlite3.connect(self.root / 'meta.db', timeout=2) as database:
+            database.row_factory = sqlite3.Row
+            try:
+                row = database.execute('SELECT * FROM task_checkpoints WHERE task_uuid=?',
+                                       (identifier,)).fetchone()
+            except sqlite3.OperationalError:
+                # Pre-checkpoint schemas have no table; tests fail on the value.
+                return None
+            return dict(row) if row else None
+
+    def kill(self):
+        if self.process is not None and self.process.poll() is None:
+            self.process.kill()
+            self.process.wait(timeout=3)
+
     def seed(self, identifier, etag='', modified=''):
         row = self.row(identifier)
         assert row['state'] in ('created', 'paused'), row
@@ -256,7 +286,7 @@ class Daemon:
                 'etag=?, last_modified=? WHERE uuid=?',
                 ('paused', len(PREFIX), len(PAYLOAD), etag, modified, identifier))
 
-    def wait(self, identifier, states=('completed', 'failed'), timeout=5):
+    def wait(self, identifier, states=("completed", "failed"), timeout=10):
         deadline = time.monotonic() + timeout
         task = None
         while time.monotonic() < deadline:
@@ -309,8 +339,9 @@ class Resilience(unittest.TestCase):
         type(self).serial += 1
         path = f'/fixture-{self.serial}'
         route = Route(kind, **options)
+        route.url = f'http://127.0.0.1:{self.server.server_port}{path}'
         self.server.routes[path] = route
-        return f'http://127.0.0.1:{self.server.server_port}{path}', route
+        return route.url, route
 
     def create(self, kind, daemon=None, extra=None, auto_name=False, **options):
         daemon = daemon or self.daemon
@@ -452,8 +483,9 @@ class Resilience(unittest.TestCase):
         self.assertLessEqual(len(finals), 2)
         self.assertNotIn('Range', finals[-1][1])
         self.assertNotIn('If-Range', finals[-1][1])
-        self.assertEqual(self.daemon.row(identifier)['etag'], '')
-        self.assertEqual(self.daemon.row(identifier)['last_modified'], '')
+        # The full request to B becomes the new representation identity.
+        self.assertEqual(self.daemon.row(identifier)['etag'], ETAG)
+        self.assertEqual(self.daemon.row(identifier)['last_modified'], MODIFIED)
 
     def test_pause_200_preserves_total_bytes(self):
         identifier, route = self.create('pause200')
@@ -477,6 +509,13 @@ class Resilience(unittest.TestCase):
             self.assertEqual(pathlib.Path(row['temp_path']).read_bytes(), PREFIX)
             self.assertFalse(pathlib.Path(row['target_path']).exists())
             self.assertEqual(len(route.snapshot()), 1)
+            checkpoint = self.daemon.checkpoint(identifier)
+            self.assertIsNotNone(checkpoint)
+            self.assertEqual(checkpoint['version'], 1)
+            self.assertEqual(checkpoint['durable_bytes'], len(PREFIX))
+            self.assertEqual(checkpoint['effective_url'], route.url)
+            self.assertEqual(checkpoint['etag'], ETAG)
+            self.assertEqual(checkpoint['last_modified'], MODIFIED)
         finally:
             route.release.set()
         self.complete(identifier, self.run_task(identifier))
@@ -506,28 +545,26 @@ class Resilience(unittest.TestCase):
     def test_429_retry_after_and_persistence(self):
         self.transient(429)
 
-    def exhausted(self, kind, **options):
-        identifier, route = self.create(kind, failures=99, **options)
+    def recovered_after_manager_retry(self, kind, **options):
+        # The adapter's burst is limited by max_retries, then the manager keeps
+        # retrying forever; the fixture recovers on the fourth response.
+        identifier, route = self.create(kind, failures=4, **options)
         task = self.run_task(identifier)
-        self.failed(identifier, task)
-        self.assertEqual(len(route.snapshot()), 3, 'initial attempt plus max_retries=2')
-        self.assertEqual(task['retry_count'], 2)
+        self.complete(identifier, task)
+        self.assertGreaterEqual(task['retry_count'], 3, task)
+        self.assertGreaterEqual(len(route.snapshot()), 4)
         row = self.daemon.row(identifier)
-        self.assertEqual(row['retry_count'], 2)
+        self.assertGreaterEqual(row['retry_count'], 3)
         self.assertEqual(row['max_retries'], 2)
-        if kind == 'drop':
-            partial = pathlib.Path(row['temp_path']).read_bytes()
-            self.assertTrue(partial)
-            self.assertEqual(partial, PAYLOAD[:len(partial)])
 
-    def test_503_max_retries(self):
-        self.exhausted('transient', status=503, delay=0)
+    def test_503_recovers_after_manager_retry(self):
+        self.recovered_after_manager_retry('transient', status=503, delay=0)
 
-    def test_429_max_retries(self):
-        self.exhausted('transient', status=429, delay=0)
+    def test_429_recovers_after_manager_retry(self):
+        self.recovered_after_manager_retry('transient', status=429, delay=0)
 
-    def test_dropped_transfer_max_retries(self):
-        self.exhausted('drop')
+    def test_dropped_transfer_recovers_after_manager_retry(self):
+        self.recovered_after_manager_retry('drop')
 
     def test_dropped_transfer_retries_with_validator(self):
         identifier, route = self.create('drop')
@@ -623,28 +660,37 @@ class Resilience(unittest.TestCase):
     def test_delete_during_backoff_is_prompt(self):
         self.cancel_backoff(True)
 
-    def test_transfer_timeout_is_overall(self):
+    def test_transfer_timeout_is_overall_and_retried(self):
         with Daemon(BINARY, timeout=1) as daemon:
             identifier, route = self.create('timeout', daemon=daemon, delay=1)
             try:
                 started = time.monotonic()
-                task = self.run_task(identifier, daemon)
+                daemon.api('/' + identifier + '/start', {})
+                deadline = time.monotonic() + 3
+                current = None
+                while time.monotonic() < deadline:
+                    current = daemon.api('/' + identifier)['task']
+                    if current['retry_count'] >= 1:
+                        break
+                    time.sleep(.02)
                 elapsed = time.monotonic() - started
-                self.failed(identifier, task, daemon)
-                self.assertGreaterEqual(elapsed, .75)
-                self.assertLess(elapsed, 1.6, 'overall budget did not interrupt backoff')
+                self.assertIsNotNone(current)
+                self.assertGreaterEqual(current['retry_count'], 1, current)
+                self.assertIn(current['state'], ('queued', 'downloading'), current)
+                self.assertGreaterEqual(elapsed, .6)
+                self.assertLess(elapsed, 2.5, 'the timeout was not retried promptly')
                 self.assertTrue(route.responded.is_set(), 'first response never arrived')
-                self.assertEqual(daemon.row(identifier)['error_code'], errno.ETIMEDOUT)
-                # 0.7s response + 1s Retry-After exceeds the shared 1s budget.
-                # A fresh per-attempt timeout would allow a second request at 1.7s.
-                self.assertEqual(len(route.snapshot()), 1)
-                self.assertEqual(task['retry_count'], 1)
+                # A retrying task can still be paused promptly.
+                started = time.monotonic()
+                daemon.api('/' + identifier + '/pause', {})
+                daemon.wait(identifier, ('paused',), timeout=2)
+                self.assertLess(time.monotonic() - started, 1.0)
             finally:
                 route.release.set()
                 daemon.api('/' + identifier, method='DELETE')
                 self.created.remove((daemon, identifier))
 
-    def test_redirect_uses_only_final_metadata(self):
+    def test_redirect_persists_only_final_metadata(self):
         final_url, final_route = self.route('range')
         identifier, route = self.create('redirect', location=final_url, auto_name=True)
         initial_name = self.daemon.row(identifier)['file_name']
@@ -652,11 +698,12 @@ class Resilience(unittest.TestCase):
         self.complete(identifier, task)
         row = self.daemon.row(identifier)
         self.assertEqual(row['file_name'], initial_name)
-        self.assertEqual(row['etag'], '')
-        self.assertEqual(row['last_modified'], '')
+        self.assertEqual(row['etag'], ETAG)
+        self.assertEqual(row['last_modified'], MODIFIED)
         self.assertFalse((pathlib.Path(row['target_directory']) / 'poison.bin').exists())
         self.assertEqual(len(route.snapshot()), 1)
         self.assertEqual(len(final_route.snapshot()), 1)
+        self.assertIsNone(self.daemon.checkpoint(identifier))
 
     def test_redirect_partial_then_direct_same_etag_restarts(self):
         final_url, final_route = self.route('pause200')
@@ -674,9 +721,12 @@ class Resilience(unittest.TestCase):
             self.daemon.api('/' + identifier + '/pause', {})
             self.daemon.wait(identifier, ('paused',), timeout=2)
             row = self.daemon.row(identifier)
+            checkpoint = self.daemon.checkpoint(identifier)
             self.assertEqual(pathlib.Path(row['temp_path']).read_bytes(), PREFIX)
-            self.assertEqual(row['etag'], '')
-            self.assertEqual(row['last_modified'], '')
+            self.assertIsNotNone(checkpoint)
+            self.assertEqual(checkpoint['effective_url'], final_url)
+            self.assertEqual(checkpoint['etag'], ETAG)
+            self.assertEqual(checkpoint['last_modified'], MODIFIED)
             self.assertEqual(len(entry_route.snapshot()), 1)
             self.assertEqual(len(final_route.snapshot()), 1)
         finally:
@@ -689,10 +739,156 @@ class Resilience(unittest.TestCase):
         self.daemon.start()
         self.complete(identifier, self.run_task(identifier), PAYLOAD[::-1])
         requests = entry_route.snapshot()
-        self.assertEqual(len(requests), 2)
-        self.assertNotIn('Range', requests[1][1])
-        self.assertNotIn('If-Range', requests[1][1])
+        # The persisted identity still points at the old final URL, so the
+        # resumed attempt is rejected after headers and the retry is full.
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(requests[1][1].get('Range'), f'bytes={len(PREFIX)}-')
+        self.assertEqual(requests[1][1].get('If-Range'), ETAG)
+        self.assertNotIn('Range', requests[2][1])
+        self.assertNotIn('If-Range', requests[2][1])
         self.assertEqual(len(final_route.snapshot()), 1)
+
+    def pause_redirected(self, final_route, identifier):
+        self.daemon.api('/' + identifier + '/start', {})
+        self.assertTrue(final_route.responded.wait(2), 'redirected prefix was not sent')
+        deadline = time.monotonic() + 2
+        while True:
+            current = self.daemon.api('/' + identifier)['task']
+            if current['downloaded_bytes'] >= len(PREFIX):
+                break
+            self.assertLess(time.monotonic(), deadline, current)
+            time.sleep(.01)
+        self.daemon.api('/' + identifier + '/pause', {})
+        self.daemon.wait(identifier, ('paused',), timeout=2)
+        checkpoint = self.daemon.checkpoint(identifier)
+        self.assertIsNotNone(checkpoint)
+        self.assertEqual(checkpoint['durable_bytes'], len(PREFIX))
+        self.assertEqual(checkpoint['etag'], ETAG)
+        self.assertEqual(checkpoint['last_modified'], MODIFIED)
+        return checkpoint
+
+    def test_redirect_pause_resumes_on_same_final_url(self):
+        # The persisted identity is the final URL, so a redirect that still
+        # lands on the same resource may append the prefix.
+        final_url, final_route = self.route('pause200')
+        identifier, entry_route = self.create('redirect', location=final_url)
+        try:
+            checkpoint = self.pause_redirected(final_route, identifier)
+            self.assertEqual(checkpoint['effective_url'], final_url)
+            self.assertEqual(len(entry_route.snapshot()), 1)
+            self.assertEqual(len(final_route.snapshot()), 1)
+        finally:
+            final_route.release.set()
+        self.daemon.stop()
+        self.daemon.start()
+        self.complete(identifier, self.run_task(identifier))
+        self.assertEqual(len(entry_route.snapshot()), 2)
+        self.assertEqual(len(final_route.snapshot()), 2)
+        resumed = final_route.snapshot()[-1][1]
+        self.assertEqual(resumed.get('Range'), f'bytes={len(PREFIX)}-')
+        self.assertEqual(resumed.get('If-Range'), ETAG)
+
+    def test_redirect_target_change_same_etag_restarts(self):
+        # A different final URL with the same ETag is a different resource.
+        first_url, first_route = self.route('pause200')
+        identifier, entry_route = self.create('redirect', location=first_url)
+        try:
+            checkpoint = self.pause_redirected(first_route, identifier)
+            self.assertEqual(checkpoint['effective_url'], first_url)
+        finally:
+            first_route.release.set()
+        replacement = PAYLOAD[::-1]
+        second_url, second_route = self.route('range', payload=replacement)
+        entry_route.options = {'location': second_url}
+        self.daemon.stop()
+        self.daemon.start()
+        self.complete(identifier, self.run_task(identifier), replacement)
+        finals = second_route.snapshot()
+        self.assertGreaterEqual(len(finals), 1)
+        self.assertLessEqual(len(finals), 2)
+        self.assertNotIn('Range', finals[-1][1])
+        self.assertNotIn('If-Range', finals[-1][1])
+
+    def test_long_effective_url_downloads_without_checkpoint(self):
+        # A redirect target longer than the task URL column cannot be compared
+        # on resume, but the download itself must still succeed.
+        path = '/long-' + 'a' * 4100
+        final_route = Route('range')
+        final_url = f'http://127.0.0.1:{self.server.server_port}{path}'
+        final_route.url = final_url
+        self.server.routes[path] = final_route
+        identifier, entry_route = self.create('redirect', location=final_url)
+        self.complete(identifier, self.run_task(identifier))
+        self.assertEqual(len(entry_route.snapshot()), 1)
+        self.assertEqual(len(final_route.snapshot()), 1)
+        self.assertIsNone(self.daemon.checkpoint(identifier))
+
+    def test_failure_before_headers_preserves_checkpoint_identity(self):
+        identifier, route = self.create('pause200')
+        try:
+            self.daemon.api('/' + identifier + '/start', {})
+            self.assertTrue(route.responded.wait(2), 'prefix was not sent')
+            deadline = time.monotonic() + 2
+            while True:
+                current = self.daemon.api('/' + identifier)['task']
+                if current['downloaded_bytes'] >= len(PREFIX):
+                    break
+                self.assertLess(time.monotonic(), deadline, current)
+                time.sleep(.01)
+            self.daemon.api('/' + identifier + '/pause', {})
+            self.daemon.wait(identifier, ('paused',), timeout=2)
+        finally:
+            route.release.set()
+        checkpoint = self.daemon.checkpoint(identifier)
+        self.assertEqual(checkpoint['durable_bytes'], len(PREFIX))
+        self.assertEqual(checkpoint['effective_url'], route.url)
+        # The next run fails before any 2xx response. It must not erase the
+        # identity against which the valid prefix was proven.
+        route.kind = 'transient'
+        route.options = {'status': 503, 'failures': 99, 'delay': 0}
+        self.daemon.api('/' + identifier + '/start', {})
+        deadline = time.monotonic() + 6
+        current = None
+        while time.monotonic() < deadline:
+            current = self.daemon.api('/' + identifier)['task']
+            if current['state'] == 'queued':
+                break
+            time.sleep(.02)
+        self.assertEqual(current['state'], 'queued', current)
+        checkpoint = self.daemon.checkpoint(identifier)
+        self.assertIsNotNone(checkpoint)
+        self.assertEqual(checkpoint['effective_url'], route.url)
+        self.assertEqual(checkpoint['durable_bytes'], len(PREFIX))
+        self.daemon.api('/' + identifier, method='DELETE')
+        self.created.remove((self.daemon, identifier))
+
+    def test_crash_resumes_from_durable_checkpoint(self):
+        identifier, route = self.create('slowrange', payload=CRASH_PAYLOAD)
+        self.daemon.api('/' + identifier + '/start', {})
+        deadline = time.monotonic() + 10
+        checkpoint = None
+        while time.monotonic() < deadline:
+            checkpoint = self.daemon.checkpoint(identifier)
+            if checkpoint and checkpoint['durable_bytes'] >= CHECKPOINT_INTERVAL:
+                break
+            time.sleep(.01)
+        self.assertIsNotNone(checkpoint, 'no durable checkpoint was written')
+        self.assertGreaterEqual(checkpoint['durable_bytes'], CHECKPOINT_INTERVAL)
+        self.assertEqual(checkpoint['effective_url'], route.url)
+        self.daemon.kill()
+        # Read exactly what SQLite committed before the crash.
+        checkpoint = self.daemon.checkpoint(identifier)
+        self.assertIsNotNone(checkpoint)
+        durable = checkpoint['durable_bytes']
+        self.assertGreaterEqual(durable, CHECKPOINT_INTERVAL)
+        self.assertLess(durable, len(CRASH_PAYLOAD))
+        self.daemon.start()
+        # The daemon auto-resumes tasks recovered from DOWNLOADING; no manual start.
+        self.complete(identifier, self.daemon.wait(identifier), CRASH_PAYLOAD)
+        resumed = route.snapshot()[-1][1]
+        self.assertEqual(resumed.get('Range'), f'bytes={durable}-')
+        self.assertEqual(resumed.get('If-Range'), ETAG)
+        self.assertIsNone(self.daemon.checkpoint(identifier))
 
     def test_redirect_loop_is_bounded(self):
         identifier, route = self.create('loop')

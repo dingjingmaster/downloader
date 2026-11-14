@@ -68,6 +68,13 @@ static void test_manifest (const char* manifest, bool accepted)
     assert ((task.networkError == 0) == accepted);
 }
 
+static void test_live_flag (const char* manifest, bool live)
+{
+    ProtocolTask task = {0};
+    assert (media_validate_manifest (&task, (const unsigned char*)manifest, strlen (manifest)) == 0);
+    assert ((bool)task.live == live);
+}
+
 static void test_output_inode (void)
 {
     char directory[] = "/tmp/downloader-media-inode-XXXXXX";
@@ -160,7 +167,7 @@ int main (int argc, char** argv)
     assert (!ops->canHandle ("http://example.invalid/a", "http"));
     test_manifest ("#EXTM3U\n#EXTINF:1,\na.ts\n#EXT-X-ENDLIST\n", true);
     test_manifest ("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\na.m3u8\n", true);
-    test_manifest ("#EXTM3U\n#EXTINF:1,\na.ts\n", false);
+    test_manifest ("#EXTM3U\n#EXTINF:1,\na.ts\n", true);
     test_manifest ("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key\"\n#EXT-X-ENDLIST\n", true);
     test_manifest ("#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"key\"\n#EXT-X-ENDLIST\n", false);
     test_manifest ("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key\",KEYFORMAT=\"identity\"\n#EXT-X-ENDLIST\n", true);
@@ -168,9 +175,14 @@ int main (int argc, char** argv)
     test_manifest ("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,KEYFORMAT=\"com.drm\"\n#EXT-X-ENDLIST\n", false);
     test_manifest ("<MPD type='static'/>", true);
     test_manifest ("<MPD/>", true);
-    test_manifest ("<MPD type = 'dynamic'/>", false);
+    test_manifest ("<MPD type = 'dynamic'/>", true);
     test_manifest ("<MPD><Period><ContentProtection/></Period></MPD>", false);
     test_manifest ("<!DOCTYPE MPD [<!ENTITY x 'static'>]><MPD type='&x;'/>", false);
+    test_live_flag ("#EXTM3U\n#EXTINF:1,\na.ts\n#EXT-X-ENDLIST\n", false);
+    test_live_flag ("#EXTM3U\n#EXTINF:1,\na.ts\n", true);
+    test_live_flag ("<MPD type='static'/>", false);
+    test_live_flag ("<MPD type='dynamic'/>", true);
+    test_live_flag ("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\na.m3u8\n", false);
     assert (ops->open (NULL, &task, NULL, NULL) == -1 && errno == EINVAL);
     snprintf (task.resourceUrl, sizeof (task.resourceUrl), "hls+http://example.invalid/a.m3u8?token=1");
     snprintf (task.protocol, sizeof (task.protocol), "hls");

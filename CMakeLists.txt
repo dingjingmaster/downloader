@@ -14,16 +14,21 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(Threads REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(CURL REQUIRED)
+find_package(OpenSSL REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(KRB5 REQUIRED IMPORTED_TARGET krb5)
+pkg_check_modules(SMBCLIENT REQUIRED IMPORTED_TARGET smbclient)
+find_library(GSSAPI_KRB5_LIBRARY NAMES gssapi_krb5 REQUIRED)
 
 set(BUILD_TESTING OFF)
 set(BUILD_TESTING OFF CACHE BOOL "Disable clib tests in downloader" FORCE)
 add_subdirectory(clib EXCLUDE_FROM_ALL)
 add_subdirectory(3thrd)
 
-add_library(download_engines STATIC protocols/engines.cpp protocols/aria.cpp protocols/media.c protocols/smb.c)
+add_library(download_engines STATIC protocols/engines.cpp protocols/aria.cpp protocols/media.c protocols/smb.c protocols/smb1.c)
 target_include_directories(download_engines PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/protocols")
 target_include_directories(download_engines PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
-target_link_libraries(download_engines PUBLIC clib::static downloader_aria2 downloader_avformat downloader_smb2)
+target_link_libraries(download_engines PUBLIC clib::static downloader_aria2 downloader_avformat downloader_smb2 PkgConfig::KRB5 PkgConfig::SMBCLIENT ${GSSAPI_KRB5_LIBRARY})
 find_library(DOWNLOADER_ANL_LIBRARY anl)
 if(DOWNLOADER_ANL_LIBRARY)
     target_link_libraries(download_engines PUBLIC "${DOWNLOADER_ANL_LIBRARY}")
@@ -41,7 +46,13 @@ add_executable(downloader
     daemon/web.c
     daemon/web-api.c
     daemon/task-manager.c
+    daemon/credential-store.c
+    daemon/request-context.c
+    daemon/web-auth.c
     protocols/http.c
+    protocols/baidu.c
+    protocols/baidu-sign.c
+    protocols/baidu-parse.c
 )
 
 target_include_directories(
@@ -50,7 +61,7 @@ target_include_directories(
         "${CMAKE_CURRENT_SOURCE_DIR}/daemon"
 )
 
-target_link_libraries(downloader PRIVATE download_engines clib::static Threads::Threads SQLite3::SQLite3 CURL::libcurl)
+target_link_libraries(downloader PRIVATE download_engines clib::static Threads::Threads SQLite3::SQLite3 CURL::libcurl OpenSSL::Crypto)
 target_compile_definitions(downloader PRIVATE DOWNLOADER_WEB_ROOT="${CMAKE_INSTALL_PREFIX}/share/downloader/web")
 
 set_target_properties(
@@ -68,12 +79,24 @@ install(DIRECTORY web/ DESTINATION share/downloader/web)
 option(DOWNLOADER_BUILD_TESTS "Build downloader tests" ON)
 if(DOWNLOADER_BUILD_TESTS)
     enable_testing()
+    # Tests use assert() for control flow and setup side effects (for example
+    # assert(fclose(config) == 0)); Release's -DNDEBUG must not compile them out.
+    add_compile_options(-UNDEBUG)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME downloader_http_transfer COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-download.py" $<TARGET_FILE:downloader>)
     add_test(NAME downloader_http_resilience COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-http-resilience.py" $<TARGET_FILE:downloader>)
     set_tests_properties(downloader_http_resilience PROPERTIES TIMEOUT 150)
+    add_test(NAME downloader_http_auth COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-http-auth.py" $<TARGET_FILE:downloader>)
+    set_tests_properties(downloader_http_auth PROPERTIES TIMEOUT 120)
+    add_test(NAME downloader_http_parallel COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-http-parallel.py" $<TARGET_FILE:downloader>)
+    add_test(NAME downloader_baidu COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-baidu.py" $<TARGET_FILE:downloader>)
+    set_tests_properties(downloader_baidu PROPERTIES TIMEOUT 180)
+    set_tests_properties(downloader_http_parallel PROPERTIES TIMEOUT 120)
     add_test(NAME downloader_bittorrent_transfer COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-bittorrent.py" $<TARGET_FILE:downloader>)
     add_test(NAME downloader_aria_adapter COMMAND "${Python3_EXECUTABLE}" -B
@@ -85,7 +108,14 @@ if(DOWNLOADER_BUILD_TESTS)
         add_test(NAME downloader_smb_transfer COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-smb.py" --build-dir "${CMAKE_BINARY_DIR}"
             --daemon $<TARGET_FILE:downloader>)
-        set_tests_properties(downloader_smb_transfer PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        set_tests_properties(downloader_smb_transfer PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME downloader_smb_kerberos COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-smb-kerberos.py"
+            --build-dir "${CMAKE_BINARY_DIR}" --daemon $<TARGET_FILE:downloader>)
+        set_tests_properties(downloader_smb_kerberos PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME downloader_smb1 COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-smb1.py" --daemon $<TARGET_FILE:downloader>)
+        set_tests_properties(downloader_smb1 PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
     endif()
     find_program(DOWNLOADER_FIXTURE_FFMPEG ffmpeg)
     find_program(DOWNLOADER_FIXTURE_FFPROBE ffprobe)
@@ -108,6 +138,8 @@ if(DOWNLOADER_BUILD_TESTS)
         daemon/config.c
     )
     target_include_directories(test_config PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
+    target_compile_definitions(test_config PRIVATE
+        DOWNLOADER_SYSTEM_CONFIG_PATH="/nonexistent/downloader/download.ini")
     target_link_libraries(test_config PRIVATE clib::static Threads::Threads)
     add_test(NAME downloader_config COMMAND test_config)
 
@@ -132,13 +164,30 @@ if(DOWNLOADER_BUILD_TESTS)
         daemon/scheduler.c
         tests/test-task-manager.c
         daemon/task-manager.c
+        daemon/request-context.c
+        daemon/credential-store.c
         daemon/database.c
         daemon/task.c
         daemon/filesystem.c
     )
     target_include_directories(test_task_manager PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
-    target_link_libraries(test_task_manager PRIVATE clib::static Threads::Threads SQLite3::SQLite3)
+    target_link_libraries(test_task_manager PRIVATE clib::static Threads::Threads SQLite3::SQLite3 OpenSSL::Crypto)
     add_test(NAME downloader_task_manager COMMAND test_task_manager)
+
+    add_executable(test_task_create
+        daemon/protocol.c
+        daemon/scheduler.c
+        tests/test-task-create.c
+        daemon/task-manager.c
+        daemon/request-context.c
+        daemon/credential-store.c
+        daemon/database.c
+        daemon/task.c
+        daemon/filesystem.c
+    )
+    target_include_directories(test_task_create PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
+    target_link_libraries(test_task_create PRIVATE clib::static Threads::Threads SQLite3::SQLite3 OpenSSL::Crypto)
+    add_test(NAME downloader_task_create COMMAND test_task_create)
 
     add_executable(test_web_api
         daemon/protocol.c
@@ -146,12 +195,14 @@ if(DOWNLOADER_BUILD_TESTS)
         tests/test-web-api.c
         daemon/web-api.c
         daemon/task-manager.c
+        daemon/request-context.c
+        daemon/credential-store.c
         daemon/database.c
         daemon/task.c
         daemon/filesystem.c
     )
     target_include_directories(test_web_api PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
-    target_link_libraries(test_web_api PRIVATE clib::static Threads::Threads SQLite3::SQLite3)
+    target_link_libraries(test_web_api PRIVATE clib::static Threads::Threads SQLite3::SQLite3 OpenSSL::Crypto)
     add_test(NAME downloader_web_api COMMAND test_web_api)
 
     add_executable(test_web_static
@@ -159,6 +210,8 @@ if(DOWNLOADER_BUILD_TESTS)
         daemon/web.c
     )
     target_include_directories(test_web_static PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
+    target_compile_definitions(test_web_static PRIVATE
+        DOWNLOADER_TEST_WEB_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/web")
     target_link_libraries(test_web_static PRIVATE clib::static Threads::Threads)
     add_test(NAME downloader_web_static COMMAND test_web_static)
 
@@ -177,14 +230,58 @@ if(DOWNLOADER_BUILD_TESTS)
     target_link_libraries(test_database PRIVATE clib::static Threads::Threads SQLite3::SQLite3)
     add_test(NAME downloader_database COMMAND test_database)
 
+    add_executable(test_credential_store
+        tests/test-credential-store.c
+        daemon/credential-store.c
+        daemon/task.c
+        daemon/database.c
+    )
+    target_include_directories(test_credential_store PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
+    target_link_libraries(test_credential_store PRIVATE clib::static Threads::Threads SQLite3::SQLite3 OpenSSL::Crypto)
+    add_test(NAME downloader_credential_store COMMAND test_credential_store)
+
+    add_executable(test_request_context
+        tests/test-request-context.c
+        daemon/request-context.c
+        daemon/credential-store.c
+        daemon/task.c
+        daemon/database.c
+    )
+    target_include_directories(test_request_context PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
+    target_link_libraries(test_request_context PRIVATE clib::static Threads::Threads SQLite3::SQLite3 OpenSSL::Crypto)
+    add_test(NAME downloader_request_context COMMAND test_request_context)
+
+    add_executable(test_web_auth
+        tests/test-web-auth.c
+        daemon/web-auth.c
+    )
+    target_include_directories(test_web_auth PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
+    target_link_libraries(test_web_auth PRIVATE clib::static Threads::Threads OpenSSL::Crypto)
+    add_test(NAME downloader_web_auth COMMAND test_web_auth)
+
     add_executable(test_protocol
         tests/test-protocol.c
         daemon/protocol.c
+        daemon/request-context.c
+        daemon/credential-store.c
+        daemon/task.c
+        daemon/database.c
         protocols/http.c
     )
     target_include_directories(test_protocol PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
-    target_link_libraries(test_protocol PRIVATE clib::static Threads::Threads CURL::libcurl)
+    target_link_libraries(test_protocol PRIVATE clib::static Threads::Threads CURL::libcurl SQLite3::SQLite3 OpenSSL::Crypto)
     add_test(NAME downloader_protocol COMMAND test_protocol)
+
+    add_executable(test_baidu
+        tests/test-baidu.c
+        protocols/baidu-sign.c
+        protocols/baidu-parse.c
+    )
+    target_include_directories(test_baidu PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/protocols"
+        "${CMAKE_CURRENT_SOURCE_DIR}/daemon")
+    target_link_libraries(test_baidu PRIVATE clib::static)
+    add_test(NAME downloader_baidu_unit COMMAND test_baidu)
 
     add_executable(test_scheduler
         tests/test-scheduler.c

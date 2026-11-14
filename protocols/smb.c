@@ -2,6 +2,7 @@
 #define _FILE_OFFSET_BITS 64
 #include "smb.h"
 
+#include <clib/json.h>
 #include <clib/memory.h>
 #include <clib/mutex.h>
 #include <clib/uri.h>
@@ -23,6 +24,7 @@
 #define DOWNLOADER_SMB_TIMEOUT_MS 30000U
 /* Public setter accepts int; bundled libsmb2 exposes the enum only privately. */
 #define DOWNLOADER_SMB_AUTH_NTLMSSP 1
+#define DOWNLOADER_SMB_AUTH_KRB5    2
 
 typedef struct
 {
@@ -49,6 +51,8 @@ struct ProtocolTask
     unsigned          port;
     bool              pauseRequested;
     bool              cancelRequested;
+    bool              kerberos;
+    char*             domain;
     bool              pending;
     int               status;
     void*             reply;
@@ -308,10 +312,82 @@ static void smb_close (ProtocolTask* task)
             password[i] = 0;
     }
     c_free (task->password);
+    c_free (task->domain);
     c_free (task->share);
     c_free (task->path);
     c_free (task);
     errno = saved;
+}
+
+static int smb_auth_options (ProtocolTask* task, const char* extra)
+{
+    CJsonDocument* document;
+    CJsonValue*    options;
+    int            result = 0;
+
+    if (extra == NULL || extra[0] == '\0')
+        return 0;
+    document = c_json_document_new_from_data (c_string_view_from_cstr (extra), C_JSON_PARSE_NONE, NULL);
+    if (document == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (c_json_value_type (c_json_document_root (document)) != C_JSON_TYPE_OBJECT) {
+        errno = EINVAL;
+        result = -1;
+        goto done;
+    }
+    options = c_json_object_get (c_json_document_root (document), c_string_view_from_cstr ("smb"));
+    if (options != NULL) {
+        CJsonValue* auth;
+        CJsonValue* domain;
+        if (c_json_value_type (options) != C_JSON_TYPE_OBJECT) {
+            errno = EINVAL;
+            result = -1;
+            goto done;
+        }
+        auth = c_json_object_get (options, c_string_view_from_cstr ("auth"));
+        if (auth != NULL) {
+            CStringView value = c_json_value_get_string (auth);
+            if (c_json_value_type (auth) != C_JSON_TYPE_STRING) {
+                errno = EINVAL;
+                result = -1;
+                goto done;
+            }
+            if ((value.size == 8 && strncasecmp (value.data, "kerberos", 8) == 0) ||
+                (value.size == 4 && strncasecmp (value.data, "krb5", 4) == 0)) {
+                task->kerberos = true;
+            } else if (!((value.size == 4 && strncasecmp (value.data, "ntlm", 4) == 0) ||
+                         (value.size == 7 && strncasecmp (value.data, "ntlmssp", 7) == 0))) {
+                errno = EINVAL;
+                result = -1;
+                goto done;
+            }
+        }
+        domain = c_json_object_get (options, c_string_view_from_cstr ("domain"));
+        if (domain != NULL) {
+            CStringView value = c_json_value_get_string (domain);
+            char*       copy;
+            if (c_json_value_type (domain) != C_JSON_TYPE_STRING || value.size == 0 || value.size > 253 ||
+                memchr (value.data, '\0', value.size) != NULL || memchr (value.data, '\r', value.size) != NULL ||
+                memchr (value.data, '\n', value.size) != NULL) {
+                errno = EINVAL;
+                result = -1;
+                goto done;
+            }
+            copy = (char*)c_malloc (value.size + 1);
+            if (copy == NULL) {
+                result = -1;
+                goto done;
+            }
+            memcpy (copy, value.data, value.size);
+            copy[value.size] = '\0';
+            task->domain = copy;
+        }
+    }
+done:
+    c_json_document_free (document);
+    return result;
 }
 
 static int smb_open (ProtocolTask** result, const DownloadTask* download,
@@ -377,6 +453,8 @@ static int smb_open (ProtocolTask** result, const DownloadTask* download,
     if (strpbrk (task->share, "/\\") != NULL || task->host[0] == '\0' ||
         strpbrk (task->host, "/\\@ \t\r\n") != NULL)
         goto invalid;
+    if (smb_auth_options (task, download->extraJson) != 0)
+        goto invalid;
     if (callbacks != NULL)
         task->callbacks = *callbacks;
     task->userData = userData;
@@ -407,16 +485,37 @@ static int smb_transfer (ProtocolTask* task)
     struct stat local = {0};
     if (smb_progress (task) != 0 || smb_resolve (task, address, sizeof (address)) != 0)
         return -1;
-    snprintf (server, sizeof (server), strchr (address, ':') != NULL ? "[%s]:%u" : "%s:%u", address, task->port);
+    if (task->kerberos) {
+        /* The Kerberos SPN is cifs/<host>; the bundled libsmb2 patch strips the
+         * port before building it. Use the URL hostname (not the numeric
+         * address) so the SPN matches the server keytab. */
+        snprintf (server, sizeof (server), strchr (task->host, ':') != NULL ? "[%s]:%u" : "%s:%u",
+                  task->host, task->port);
+    } else {
+        snprintf (server, sizeof (server), strchr (address, ':') != NULL ? "[%s]:%u" : "%s:%u", address,
+                  task->port);
+    }
     task->smb = smb2_init_context ();
     if (task->smb == NULL) {
         errno = ENOMEM;
         return -1;
     }
     smb2_set_version (task->smb, SMB2_VERSION_ANY);
-    smb2_set_authentication (task->smb, DOWNLOADER_SMB_AUTH_NTLMSSP);
+    smb2_set_authentication (task->smb, task->kerberos ? DOWNLOADER_SMB_AUTH_KRB5
+                                                       : DOWNLOADER_SMB_AUTH_NTLMSSP);
     smb2_set_user (task->smb, task->user);
     smb2_set_password (task->smb, task->user[0] == '\0' ? NULL : task->password);
+    if (task->kerberos && task->domain != NULL)
+        smb2_set_domain (task->smb, task->domain);
+    if (task->kerberos && task->password[0] != '\0') {
+        /* Use the password to acquire a ticket in an isolated MEMORY ccache
+         * instead of the process-wide KRB5CCNAME. */
+        if (task->domain == NULL) {
+            errno = EINVAL;
+            return -1;
+        }
+        smb2_set_use_cached_creds (task->smb, 1);
+    }
     smb2_set_security_mode (task->smb, SMB2_NEGOTIATE_SIGNING_ENABLED);
     smb2_set_timeout (task->smb, DOWNLOADER_SMB_TIMEOUT_MS / 1000);
     smb_prepare (task);
@@ -549,6 +648,10 @@ static int smb_run (ProtocolTask* task)
         task->callbacks.onStarted (task->userData);
     int result = smb_transfer (task);
     int error = result == 0 ? 0 : errno;
+    char detail[DOWNLOAD_TASK_ERROR_SIZE];
+    detail[0] = '\0';
+    if (task->smb != NULL)
+        snprintf (detail, sizeof (detail), "%s", smb2_get_error (task->smb));
     /* Abort commands and release all handles/sockets without waiting for a
      * disconnect handshake. Task-owned read buffers remain alive throughout. */
     if (task->smb != NULL) {
@@ -569,8 +672,12 @@ static int smb_run (ProtocolTask* task)
         return 1;
     }
     if (error != 0) {
-        if (task->callbacks.onFailed != NULL)
-            task->callbacks.onFailed (task->userData, error, smb_error_message (error));
+        if (task->callbacks.onFailed != NULL) {
+            char message[DOWNLOAD_TASK_ERROR_SIZE];
+            snprintf (message, sizeof (message), "%s%s%s", smb_error_message (error),
+                      detail[0] != '\0' ? ": " : "", detail);
+            task->callbacks.onFailed (task->userData, error, message);
+        }
         errno = error;
         return -1;
     }
@@ -609,6 +716,15 @@ static int smb_cancel (ProtocolTask* task)
     return 0;
 }
 
+static bool smb_retryable (ProtocolTask* task, int errorCode, const char* message)
+{
+    (void)task;
+    (void)message;
+    return errorCode == EIO || errorCode == EAGAIN || errorCode == ETIMEDOUT || errorCode == ECONNRESET ||
+           errorCode == ECONNREFUSED || errorCode == EHOSTUNREACH || errorCode == ENETUNREACH ||
+           errorCode == ENETDOWN || errorCode == EPIPE || errorCode == ECONNABORTED;
+}
+
 const ProtocolOps* smb_protocol_ops (void)
 {
     static const ProtocolOps operations = {
@@ -618,7 +734,7 @@ const ProtocolOps* smb_protocol_ops (void)
         .run = smb_run,
         .pause = smb_pause,
         .resume = smb_resume,
-        .cancel = smb_cancel,
+        .cancel = smb_cancel, .retryable = smb_retryable,
         .close = smb_close
     };
     return &operations;

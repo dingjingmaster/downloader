@@ -1,6 +1,7 @@
 #include "aria.h"
 
 #include <aria2/aria2.h>
+#include <clib/cond.h>
 #include <clib/directory.h>
 #include <clib/memory.h>
 #include <clib/mutex.h>
@@ -8,27 +9,117 @@
 #include <clib/uri.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
-#include <cstring>
 #include <cstdlib>
-#include <exception>
+#include <cstring>
+#include <fcntl.h>
 #include <limits.h>
 #include <memory>
 #include <new>
 #include <set>
 #include <string>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <thread>
 #include <time.h>
 #include <unistd.h>
 #include <vector>
 
-/* C++ containers are used only at the libaria2 boundary. No aria2 object escapes
- * run, including when a callback requests pause/cancel on this worker thread. */
+/* One process-wide aria2 engine owns the single libaria2 session on a dedicated
+ * thread. Download workers submit tasks and wait for snapshots; every callback
+ * therefore runs on the worker thread that owns the task. */
 enum DownloadAriaRequest
 {
     DOWNLOAD_ARIA_REQUEST_RUN,
     DOWNLOAD_ARIA_REQUEST_PAUSE,
     DOWNLOAD_ARIA_REQUEST_CANCEL
+};
+
+enum DownloadEnginePhase
+{
+    DOWNLOAD_ENGINE_PHASE_RUNNING,
+    DOWNLOAD_ENGINE_PHASE_PAUSED,
+    DOWNLOAD_ENGINE_PHASE_CANCELLED,
+    DOWNLOAD_ENGINE_PHASE_COMPLETED,
+    DOWNLOAD_ENGINE_PHASE_FAILED
+};
+
+/* Terminal data is cached: libaria2 prunes completed results, so a long-lived
+ * session must not depend on getDownloadHandle() for finished GIDs. */
+struct DownloadNode
+{
+    aria2::A2Gid              gid;
+    bool                      checked;
+    bool                      metadata;
+    bool                      complete;
+    bool                      hasInfoHash;
+    int64_t                   totalLength;
+    int64_t                   completedLength;
+    std::string               btName;
+    std::vector<aria2::FileData> files;
+    explicit DownloadNode (aria2::A2Gid value)
+        : gid (value), checked (false), metadata (false), complete (false), hasInfoHash (false),
+          totalLength (0), completedLength (0) {}
+};
+
+struct DownloadEngineTask
+{
+    CMutex                 mutex;
+    CCond                  cond;
+    bool                   mutexReady;
+    bool                   condReady;
+    uint64_t               generation;
+    DownloadAriaRequest    request;
+    DownloadEnginePhase            phase;
+    int                    error;
+    uint64_t               total;
+    uint64_t               completed;
+    uint64_t               speed;
+    bool                   hasFileName;
+    std::string            fileName;
+    std::vector<std::string> payloadFiles;
+    std::vector<std::string> metadataFiles;
+
+    /* Set by the worker before submission; owned by the engine afterwards. */
+    std::string            url;
+    std::string            protocol;
+    std::string            stage;
+    std::string            privateDirectory;
+    std::string            fetched;
+    bool                   fetchedDescriptor;
+    bool                   metalink;
+    std::vector<DownloadNode> nodes;
+    aria2::A2Gid           descriptor;
+    bool                   fetching;
+    bool                   added;
+    bool                   stopping;
+    DownloadEnginePhase    stopPhase;
+    int                    stopError;
+
+    DownloadEngineTask ()
+        : mutexReady (false), condReady (false), generation (0), request (DOWNLOAD_ARIA_REQUEST_RUN),
+          phase (DOWNLOAD_ENGINE_PHASE_RUNNING), error (0), total (0), completed (0), speed (0), hasFileName (false),
+          fetchedDescriptor (false), metalink (false), descriptor (0), fetching (false), added (false),
+          stopping (false), stopPhase (DOWNLOAD_ENGINE_PHASE_RUNNING), stopError (0)
+    {
+        if (!c_mutex_init (&mutex))
+            throw std::bad_alloc ();
+        mutexReady = true;
+        if (!c_cond_init (&cond)) {
+            c_mutex_clear (&mutex);
+            mutexReady = false;
+            throw std::bad_alloc ();
+        }
+        condReady = true;
+    }
+    ~DownloadEngineTask ()
+    {
+        if (condReady)
+            c_cond_clear (&cond);
+        if (mutexReady)
+            c_mutex_clear (&mutex);
+    }
 };
 
 struct ProtocolTask
@@ -37,10 +128,20 @@ struct ProtocolTask
     ProtocolCallbacks      callbacks;
     void*                  userData;
     CMutex                 mutex;
+    bool                   mutexReady;
     DownloadAriaRequest    request;
-    uint64_t               lastTotal;
-    uint64_t               lastCompleted;
-    uint64_t               lastSpeed;
+    std::shared_ptr<DownloadEngineTask> engineTask;
+
+    ProtocolTask () : userData (NULL), mutexReady (false), request (DOWNLOAD_ARIA_REQUEST_RUN)
+    {
+        if (c_mutex_init (&mutex))
+            mutexReady = true;
+    }
+    ~ProtocolTask ()
+    {
+        if (mutexReady)
+            c_mutex_clear (&mutex);
+    }
 };
 
 namespace {
@@ -60,107 +161,6 @@ static void require_system (int result)
 {
     if (result < 0)
         throw AdapterError (errno);
-}
-
-struct Runtime
-{
-    CMutex mutex;
-    bool initialized;
-    Runtime () : mutex (), initialized (false)
-    {
-        require (c_mutex_init (&mutex), ENOMEM);
-    }
-    ~Runtime ()
-    {
-        // Application must join workers before process teardown.
-        if (initialized) {
-            try { aria2::libraryDeinit (); } catch (...) {}
-        }
-        c_mutex_clear (&mutex);
-    }
-};
-
-static Runtime& runtime ()
-{
-    static Runtime instance;
-    return instance;
-}
-
-static DownloadAriaRequest request (ProtocolTask* task)
-{
-    c_mutex_lock (&task->mutex);
-    DownloadAriaRequest value = task->request;
-    c_mutex_unlock (&task->mutex);
-    return value;
-}
-
-static void progress (ProtocolTask* task, uint64_t total = 0, uint64_t completed = 0, uint64_t speed = 0)
-{
-    task->lastTotal = total;
-    task->lastCompleted = completed;
-    task->lastSpeed = speed;
-    if (task->callbacks.onProgress)
-        task->callbacks.onProgress (task->userData, total, completed, speed);
-}
-
-struct SessionOwner
-{
-    Runtime& owner;
-    bool locked;
-    ProtocolTask* task;
-    aria2::Session* session;
-    SessionOwner (Runtime& value, ProtocolTask* context)
-        : owner (value), locked (false), task (context), session (NULL) {}
-    ~SessionOwner ()
-    {
-        // Normal exits use finish(), which reports shutdown/finalization errors.
-        // Exception cleanup must not throw through the C ABI.
-        if (session) {
-            try { finish (); } catch (...) {}
-        }
-        if (locked)
-            c_mutex_unlock (&owner.mutex);
-    }
-    void finish (bool completed = false)
-    {
-        if (!session)
-            return;
-        int result = -1;
-        std::exception_ptr failure;
-        try {
-            result = aria2::shutdown (session, true);
-            if (result >= 0) {
-                do {
-                    result = aria2::run (session, aria2::RUN_ONCE);
-                    if (result > 0 && !failure) {
-                        try {
-                            progress (task, task->lastTotal, task->lastCompleted, task->lastSpeed);
-                        } catch (...) {
-                            failure = std::current_exception ();
-                        }
-                    }
-                } while (result > 0);
-            }
-        } catch (...) {
-            failure = std::current_exception ();
-        }
-        aria2::Session* finished = session;
-        session = NULL;
-        int finalResult = aria2::sessionFinal (finished);
-        if (failure)
-            std::rethrow_exception (failure);
-        // IN_PROGRESS (7) is normal when shutting down for pause/cancel.
-        require (result >= 0 && (!completed || finalResult == 0));
-    }
-};
-
-typedef std::unique_ptr<aria2::DownloadHandle, void (*) (aria2::DownloadHandle*)> Handle;
-
-static Handle handle (aria2::Session* session, aria2::A2Gid gid)
-{
-    Handle result (aria2::getDownloadHandle (session, gid), aria2::deleteDownloadHandle);
-    require (result.get () != NULL);
-    return result;
 }
 
 /* Reject links and non-regular objects in a resumed stage before aria2 opens
@@ -272,14 +272,6 @@ static std::string local_metadata (const std::string& url)
     return path;
 }
 
-struct DownloadNode
-{
-    aria2::A2Gid gid;
-    bool checked;
-    bool metadata;
-    explicit DownloadNode (aria2::A2Gid value) : gid (value), checked (false), metadata (false) {}
-};
-
 static void append_nodes (std::vector<DownloadNode>& nodes, const std::vector<aria2::A2Gid>& gids)
 {
     for (aria2::A2Gid gid : gids) {
@@ -292,9 +284,10 @@ static void append_nodes (std::vector<DownloadNode>& nodes, const std::vector<ar
 }
 
 static void add_descriptor (aria2::Session* session, const std::string& path, bool metalink,
-                            std::vector<DownloadNode>& nodes, const std::string& base)
+                            std::vector<DownloadNode>& nodes, const std::string& base,
+                            const std::string& directory)
 {
-    aria2::KeyVals options = { { "pause", "true" } };
+    aria2::KeyVals options = { { "pause", "true" }, { "dir", directory }, { "continue", "true" } };
     if (!base.empty ())
         options.push_back ({ "metalink-base-uri", base });
     std::vector<aria2::A2Gid> gids;
@@ -334,31 +327,626 @@ static void remove_owned (const std::string& path)
     require_system (unlink (path.c_str ()));
 }
 
-static int execute (ProtocolTask* task)
+struct DownloadAriaEngine
 {
-    Runtime& shared = runtime ();
-    SessionOwner owner (shared, task);
-    while (!c_mutex_try_lock (&shared.mutex)) {
-        progress (task, task->source.totalBytes, task->source.downloadedBytes, 0);
-        if (request (task) != DOWNLOAD_ARIA_REQUEST_RUN)
-            return request (task) == DOWNLOAD_ARIA_REQUEST_PAUSE ? 1 : -1;
-        struct timespec delay = { 0, 100000000 };
-        while (nanosleep (&delay, &delay) != 0)
-            require (errno == EINTR, errno);
+    CMutex                 mutex;
+    CCond                  cond;
+    bool                   mutexReady;
+    bool                   condReady;
+    std::thread            thread;
+    bool                   started;
+    bool                   stopping;
+    std::atomic<bool>      failed;
+    bool                   initialized;
+    aria2::Session*        session;
+    std::string            directory;
+    int                    lockDescriptor;
+    bool                   temporaryDirectory;
+    std::vector<std::shared_ptr<DownloadEngineTask>> pending;
+    std::vector<std::shared_ptr<DownloadEngineTask>> tasks;
+
+    DownloadAriaEngine ()
+        : mutexReady (false), condReady (false), started (false), stopping (false), failed (false),
+          initialized (false), session (NULL), lockDescriptor (-1), temporaryDirectory (false)
+    {
+        if (!c_mutex_init (&mutex))
+            throw std::bad_alloc ();
+        mutexReady = true;
+        if (!c_cond_init (&cond)) {
+            c_mutex_clear (&mutex);
+            mutexReady = false;
+            throw std::bad_alloc ();
+        }
+        condReady = true;
     }
-    owner.locked = true;
-    progress (task, task->source.totalBytes, task->source.downloadedBytes, 0);
-    if (request (task) != DOWNLOAD_ARIA_REQUEST_RUN)
-        return request (task) == DOWNLOAD_ARIA_REQUEST_PAUSE ? 1 : -1;
-    if (!shared.initialized) {
-        require (aria2::libraryInit () == 0);
-        shared.initialized = true;
+    ~DownloadAriaEngine ()
+    {
+        if (condReady)
+            c_cond_clear (&cond);
+        if (mutexReady)
+            c_mutex_clear (&mutex);
+    }
+};
+
+struct DownloadEngineLock
+{
+    CMutex* mutex;
+    bool    held;
+    explicit DownloadEngineLock (CMutex* value) : mutex (value), held (false) { lock (); }
+    ~DownloadEngineLock () { unlock (); }
+    void lock ()
+    {
+        if (!held) {
+            c_mutex_lock (mutex);
+            held = true;
+        }
+    }
+    void unlock ()
+    {
+        if (held) {
+            c_mutex_unlock (mutex);
+            held = false;
+        }
+    }
+};
+
+static DownloadAriaEngine& engine_instance ()
+{
+    static DownloadAriaEngine* instance = new DownloadAriaEngine ();
+    return *instance;
+}
+
+static void publish_snapshot (DownloadEngineTask& task, DownloadEnginePhase phase, int error, uint64_t total,
+                              uint64_t completed, uint64_t speed, bool hasFileName,
+                              const std::string& fileName, const std::vector<std::string>* payloadFiles,
+                              const std::vector<std::string>* metadataFiles)
+{
+    DownloadEngineLock guard (&task.mutex);
+    task.phase = phase;
+    task.error = error;
+    task.total = total;
+    task.completed = completed;
+    task.speed = speed;
+    task.hasFileName = hasFileName;
+    if (hasFileName)
+        task.fileName = fileName;
+    if (payloadFiles != NULL)
+        task.payloadFiles = *payloadFiles;
+    if (metadataFiles != NULL)
+        task.metadataFiles = *metadataFiles;
+    ++task.generation;
+    c_cond_notify_all (&task.cond);
+}
+
+static void publish_terminal (DownloadEngineTask& task, DownloadEnginePhase phase, int error)
+{
+    publish_snapshot (task, phase, error, 0, 0, 0, false, std::string (), NULL, NULL);
+}
+
+static std::vector<aria2::A2Gid> owned_gids (const DownloadEngineTask& task)
+{
+    std::vector<aria2::A2Gid> values;
+    if (task.fetching && !aria2::isNull (task.descriptor))
+        values.push_back (task.descriptor);
+    for (const DownloadNode& node : task.nodes)
+        values.push_back (node.gid);
+    std::vector<aria2::A2Gid> result;
+    for (aria2::A2Gid gid : values) {
+        if (std::find (result.begin (), result.end (), gid) == result.end ())
+            result.push_back (gid);
+    }
+    return result;
+}
+
+static std::string engine_directory (int* lockDescriptor, bool* temporary)
+{
+    *lockDescriptor = -1;
+    *temporary = false;
+    std::string base;
+    const char* cache = getenv ("XDG_CACHE_HOME");
+    if (cache != NULL && cache[0] == '/')
+        base = cache;
+    else {
+        const char* home = getenv ("HOME");
+        if (home != NULL && home[0] == '/')
+            base = std::string (home) + "/.cache";
+    }
+    if (!base.empty ()) {
+        std::string path = base + "/downloader/aria2";
+        struct stat status;
+        if (c_directory_create_parents (path.c_str ()) == 0 && lstat (path.c_str (), &status) == 0 &&
+            S_ISDIR (status.st_mode) && !S_ISLNK (status.st_mode) && chmod (path.c_str (), 0700) == 0) {
+            int descriptor = open ((path + "/engine.lock").c_str (), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+            if (descriptor >= 0 && flock (descriptor, LOCK_EX | LOCK_NB) == 0) {
+                *lockDescriptor = descriptor;
+                return path;
+            }
+            if (descriptor >= 0)
+                close (descriptor);
+        }
+    }
+    /* Another daemon owns the shared DHT state; use a private engine directory. */
+    char templatePath[] = "/tmp/downloader-aria-XXXXXX";
+    char* created = mkdtemp (templatePath);
+    if (created == NULL)
+        return std::string ();
+    *temporary = true;
+    return std::string (created);
+}
+
+static void engine_cleanup_directory (DownloadAriaEngine& engine)
+{
+    if (engine.temporaryDirectory && !engine.directory.empty ())
+        (void)c_directory_remove_recursive (engine.directory.c_str ());
+    if (engine.lockDescriptor >= 0)
+        (void)close (engine.lockDescriptor);
+    engine.lockDescriptor = -1;
+    engine.directory.clear ();
+    engine.temporaryDirectory = false;
+}
+
+static void engine_loop (DownloadAriaEngine* engine);
+
+static int engine_start_locked (DownloadAriaEngine& engine)
+{
+    if (engine.started)
+        return 0;
+    if (engine.failed.load ()) {
+        errno = EIO;
+        return -1;
+    }
+    engine.directory = engine_directory (&engine.lockDescriptor, &engine.temporaryDirectory);
+    if (engine.directory.empty ()) {
+        errno = EIO;
+        return -1;
+    }
+    if (!engine.initialized) {
+        if (aria2::libraryInit () != 0) {
+            engine_cleanup_directory (engine);
+            errno = EIO;
+            return -1;
+        }
+        engine.initialized = true;
+    }
+    aria2::KeyVals options = {
+        { "no-conf", "true" }, { "no-netrc", "true" }, { "enable-rpc", "false" },
+        { "check-certificate", "true" }, { "continue", "true" },
+        { "auto-file-renaming", "false" }, { "allow-overwrite", "false" },
+        { "check-integrity", "true" }, { "seed-time", "0" }, { "seed-ratio", "0.0" },
+        { "follow-torrent", "mem" }, { "follow-metalink", "mem" }, { "pause-metadata", "true" },
+        { "bt-load-saved-metadata", "false" },
+        { "bt-save-metadata", "false" }, { "bt-enable-lpd", "false" },
+        { "enable-dht", "true" }, { "enable-dht6", "false" },
+        { "dht-file-path", engine.directory + "/dht" }, { "dht-file-path6", engine.directory + "/dht6" },
+        { "max-download-result", "100" }, { "auto-save-interval", "1" },
+        { "max-concurrent-downloads", "64" },
+        { "file-allocation", "none" }, { "console-log-level", "error" },
+        { "summary-interval", "0" }, { "download-result", "hide" }
+    };
+    aria2::SessionConfig config;
+    config.useSignalHandler = false;
+    config.keepRunning = true;
+    engine.session = aria2::sessionNew (options, config);
+    if (engine.session == NULL) {
+        (void)aria2::libraryDeinit ();
+        engine.initialized = false;
+        engine_cleanup_directory (engine);
+        errno = EIO;
+        return -1;
+    }
+    engine.stopping = false;
+    try {
+        engine.thread = std::thread (engine_loop, &engine);
+    } catch (...) {
+        (void)aria2::sessionFinal (engine.session);
+        engine.session = NULL;
+        (void)aria2::libraryDeinit ();
+        engine.initialized = false;
+        engine_cleanup_directory (engine);
+        errno = EAGAIN;
+        return -1;
+    }
+    engine.started = true;
+    return 0;
+}
+
+static int engine_enqueue (DownloadAriaEngine& engine, const std::shared_ptr<DownloadEngineTask>& task)
+{
+    int result;
+
+    DownloadEngineLock guard (&engine.mutex);
+    result = engine_start_locked (engine);
+    if (result == 0) {
+        engine.pending.push_back (task);
+        c_cond_notify_all (&engine.cond);
+    }
+    return result;
+}
+
+static int engine_task_add (DownloadAriaEngine& engine, DownloadEngineTask& task)
+{
+    aria2::Session* session = engine.session;
+    if (task.url.compare (0, 7, "magnet:") == 0) {
+        aria2::A2Gid gid = 0;
+        aria2::KeyVals options = { { "dir", task.stage }, { "continue", "true" }, { "pause", "true" } };
+        if (aria2::addUri (session, &gid, { task.url }, options) != 0 || aria2::isNull (gid))
+            return EINVAL;
+        task.nodes.push_back (DownloadNode (gid));
+        task.nodes.back ().metadata = true;
+    } else if (task.url.compare (0, 7, "file://") == 0) {
+        add_descriptor (session, local_metadata (task.url), task.metalink, task.nodes, "", task.stage);
+    } else {
+        aria2::KeyVals options = {
+            { "dir", task.privateDirectory }, { "out", "descriptor" },
+            { "follow-torrent", "false" }, { "follow-metalink", "false" },
+            { "enable-http-pipelining", "false" }
+        };
+        if (aria2::addUri (session, &task.descriptor, { task.url }, options) != 0 ||
+            aria2::isNull (task.descriptor))
+            return EINVAL;
+        task.fetching = true;
+    }
+    return 0;
+}
+
+/* Returns false once the task reached a terminal phase and was signalled. */
+static bool engine_task_update (DownloadAriaEngine& engine, const std::shared_ptr<DownloadEngineTask>& task)
+{
+    aria2::Session* session = engine.session;
+    DownloadAriaRequest request;
+
+    c_mutex_lock (&task->mutex);
+    request = task->request;
+    c_mutex_unlock (&task->mutex);
+
+    if (request != DOWNLOAD_ARIA_REQUEST_RUN && !task->stopping) {
+        task->stopping = true;
+        task->stopPhase =
+            request == DOWNLOAD_ARIA_REQUEST_PAUSE ? DOWNLOAD_ENGINE_PHASE_PAUSED : DOWNLOAD_ENGINE_PHASE_CANCELLED;
+        for (aria2::A2Gid gid : owned_gids (*task))
+            (void)aria2::removeDownload (session, gid, true);
+    }
+    if (task->stopping) {
+        bool removed = true;
+        for (size_t index = 0; index < task->nodes.size (); ++index) {
+            aria2::A2Gid gid = task->nodes[index].gid;
+            std::unique_ptr<aria2::DownloadHandle, void (*) (aria2::DownloadHandle*)> current (
+                aria2::getDownloadHandle (session, gid), aria2::deleteDownloadHandle);
+            if (!current)
+                continue;
+            /* A descriptor can complete in the same iteration in which pause is
+             * observed and spawn paused followedBy/belongsTo children. Those
+             * children are not removed by removing the parent, so discover and
+             * remove them transitively before declaring the task stopped. */
+            std::vector<aria2::A2Gid> children = current->getFollowedBy ();
+            aria2::A2Gid parent = current->getBelongsTo ();
+            if (!aria2::isNull (parent))
+                append_nodes (task->nodes, { parent });
+            if (!children.empty ())
+                append_nodes (task->nodes, children);
+            (void)aria2::removeDownload (session, gid, true);
+            aria2::DownloadStatus status = current->getStatus ();
+            if (status != aria2::DOWNLOAD_REMOVED && status != aria2::DOWNLOAD_ERROR &&
+                status != aria2::DOWNLOAD_COMPLETE)
+                removed = false;
+        }
+        if (!removed)
+            return true;
+        publish_terminal (*task, task->stopPhase,
+                          task->stopPhase == DOWNLOAD_ENGINE_PHASE_FAILED ? task->stopError : 0);
+        return false;
     }
 
+    if (task->fetching) {
+        std::unique_ptr<aria2::DownloadHandle, void (*) (aria2::DownloadHandle*)> download (
+            aria2::getDownloadHandle (session, task->descriptor), aria2::deleteDownloadHandle);
+        require (download.get () != NULL, EIO);
+        aria2::DownloadStatus status = download->getStatus ();
+        require (status != aria2::DOWNLOAD_ERROR && status != aria2::DOWNLOAD_REMOVED, EIO);
+        if (status == aria2::DOWNLOAD_COMPLETE) {
+            download.reset ();
+            add_descriptor (session, task->fetched, task->metalink, task->nodes, task->url, task->stage);
+            task->fetching = false;
+        }
+    }
+
+    uint64_t total = 0, completed = 0, speed = 0;
+    bool done = !task->fetching && !task->nodes.empty ();
+    bool hasName = false;
+    std::string name;
+    size_t payloadCount = 0;
+    std::set<std::string> payloadFiles;
+    std::set<std::string> metadataFiles;
+    std::set<std::string> controlFiles;
+    for (size_t index = 0; index < task->nodes.size (); ++index) {
+        if (!task->nodes[index].complete) {
+            /* append_nodes() may reallocate task->nodes; re-index after it. */
+            DownloadNode& node = task->nodes[index];
+            std::unique_ptr<aria2::DownloadHandle, void (*) (aria2::DownloadHandle*)> download (
+                aria2::getDownloadHandle (session, node.gid), aria2::deleteDownloadHandle);
+            require (download.get () != NULL, EIO);
+            std::vector<aria2::A2Gid> children = download->getFollowedBy ();
+            // Metalink metaurl torrents are auxiliary metadata with belongsTo,
+            // rather than followedBy. Their parent is the actual payload task.
+            aria2::A2Gid parent = download->getBelongsTo ();
+            bool auxiliary = !aria2::isNull (parent);
+            if (auxiliary) {
+                node.metadata = true;
+                append_nodes (task->nodes, { parent });
+            }
+            if (!children.empty ()) {
+                /* append_nodes() may reallocate; re-index instead of reusing
+                 * the reference obtained before the first append. */
+                task->nodes[index].metadata = true;
+                append_nodes (task->nodes, children);
+            }
+            DownloadNode& current = task->nodes[index];
+            // Post-download parse errors can be swallowed by libaria2 while
+            // leaving the descriptor status COMPLETE. A recognized descriptor
+            // is never a terminal payload, even if no children were generated.
+            current.hasInfoHash = !download->getInfoHash ().empty ();
+            if (!current.hasInfoHash) {
+                for (const aria2::FileData& file : download->getFiles ()) {
+                    if (descriptor_path (file.path))
+                        current.metadata = true;
+                }
+            }
+            aria2::DownloadStatus status = download->getStatus ();
+            require (status != aria2::DOWNLOAD_ERROR && status != aria2::DOWNLOAD_REMOVED, EIO);
+            if (!current.checked) {
+                if (!current.metadata)
+                    validate_files (download.get (), task->stage);
+                if (status == aria2::DOWNLOAD_PAUSED)
+                    require (aria2::unpauseDownload (session, current.gid) == 0);
+                current.checked = true;
+            }
+            if (status != aria2::DOWNLOAD_COMPLETE) {
+                done = false;
+                if (status == aria2::DOWNLOAD_ACTIVE || status == aria2::DOWNLOAD_WAITING ||
+                    status == aria2::DOWNLOAD_PAUSED) {
+                    std::string btName = download->getBtMetaInfo ().name;
+                    if (!btName.empty ())
+                        current.btName = btName;
+                }
+                speed += static_cast<uint64_t> (std::max (0, download->getDownloadSpeed ()));
+            } else {
+                current.complete = true;
+                if (current.metadata)
+                    require (auxiliary || !children.empty (), EINVAL);
+            }
+            current.files = download->getFiles ();
+            current.totalLength = std::max<int64_t> (0, download->getTotalLength ());
+            current.completedLength = std::max<int64_t> (0, download->getCompletedLength ());
+        }
+        DownloadNode& node = task->nodes[index];
+        if (node.metadata) {
+            // Prefer memory, but aria2 may keep known-length followed
+            // descriptors on disk. Track only exact paths reported by a
+            // metadata node, never infer ownership from a file suffix.
+            for (const aria2::FileData& file : node.files) {
+                if (file.path.compare (0, task->stage.size () + 1, task->stage + "/") == 0) {
+                    require (safe_relative (file.path.substr (task->stage.size () + 1)), EPERM);
+                    metadataFiles.insert (file.path);
+                }
+            }
+            continue;
+        }
+        ++payloadCount;
+        for (const aria2::FileData& file : node.files) {
+            if (!file.path.empty ()) {
+                payloadFiles.insert (file.path);
+                // Multi-file torrents use <torrent-root>.aria2, outside
+                // their nested payload directory but still inside stage.
+                size_t slash = file.path.find ('/', task->stage.size () + 1);
+                if (slash != std::string::npos && node.hasInfoHash)
+                    controlFiles.insert (file.path.substr (0, slash) + ".aria2");
+                else
+                    controlFiles.insert (file.path + ".aria2");
+            }
+        }
+        total += static_cast<uint64_t> (node.totalLength);
+        completed += static_cast<uint64_t> (node.completedLength);
+        name = safe_name (node.btName.empty () ? descriptor_name (task->url) : node.btName);
+        hasName = true;
+    }
+    for (const std::string& control : controlFiles)
+        require (payloadFiles.count (control) == 0, EINVAL);
+
+    std::vector<std::string> payloadList (payloadFiles.begin (), payloadFiles.end ());
+    std::vector<std::string> metadataList (metadataFiles.begin (), metadataFiles.end ());
+    publish_snapshot (*task, DOWNLOAD_ENGINE_PHASE_RUNNING, 0, total, completed, speed, hasName, name, NULL, NULL);
+    if (done) {
+        /* A pause that arrived while the last piece finished must not be
+         * reported as completion; the core would keep the task paused anyway. */
+        DownloadAriaRequest finalRequest;
+        c_mutex_lock (&task->mutex);
+        finalRequest = task->request;
+        c_mutex_unlock (&task->mutex);
+        if (finalRequest != DOWNLOAD_ARIA_REQUEST_RUN) {
+            for (aria2::A2Gid gid : owned_gids (*task))
+                (void)aria2::removeDownload (session, gid, true);
+            publish_terminal (*task,
+                              finalRequest == DOWNLOAD_ARIA_REQUEST_PAUSE ? DOWNLOAD_ENGINE_PHASE_PAUSED
+                                                                          : DOWNLOAD_ENGINE_PHASE_CANCELLED,
+                              0);
+            return false;
+        }
+        require (payloadCount > 0, EINVAL);
+        for (aria2::A2Gid gid : owned_gids (*task))
+            (void)aria2::removeDownload (session, gid, true);
+        publish_snapshot (*task, DOWNLOAD_ENGINE_PHASE_COMPLETED, 0, total, completed, speed, hasName, name,
+                          &payloadList, &metadataList);
+        return false;
+    }
+    return true;
+}
+
+static void engine_fail_all (DownloadAriaEngine& engine, int error)
+{
+    for (const std::shared_ptr<DownloadEngineTask>& task : engine.tasks) {
+        try {
+            publish_terminal (*task, DOWNLOAD_ENGINE_PHASE_FAILED, error);
+        } catch (...) {
+        }
+    }
+    for (const std::shared_ptr<DownloadEngineTask>& task : engine.pending) {
+        try {
+            publish_terminal (*task, DOWNLOAD_ENGINE_PHASE_FAILED, error);
+        } catch (...) {
+        }
+    }
+    engine.tasks.clear ();
+    engine.pending.clear ();
+}
+
+static void engine_loop_body (DownloadAriaEngine* engine)
+{
+    DownloadEngineLock guard (&engine->mutex);
+    while (!engine->stopping) {
+        if (engine->pending.empty () && engine->tasks.empty ()) {
+            c_cond_wait (&engine->cond, &engine->mutex);
+            continue;
+        }
+        for (const std::shared_ptr<DownloadEngineTask>& task : engine->pending)
+            engine->tasks.push_back (task);
+        engine->pending.clear ();
+
+        bool any = false;
+        for (size_t index = 0; index < engine->tasks.size ();) {
+            std::shared_ptr<DownloadEngineTask> task = engine->tasks[index];
+            if (!task->added) {
+                int addResult;
+                try {
+                    addResult = engine_task_add (*engine, *task);
+                } catch (const AdapterError& failure) {
+                    addResult = failure.code;
+                } catch (...) {
+                    addResult = EIO;
+                }
+                if (addResult != 0) {
+                    for (aria2::A2Gid gid : owned_gids (*task))
+                        (void)aria2::removeDownload (engine->session, gid, true);
+                    publish_terminal (*task, DOWNLOAD_ENGINE_PHASE_FAILED, addResult);
+                    engine->tasks.erase (engine->tasks.begin () + static_cast<std::ptrdiff_t> (index));
+                    continue;
+                }
+                task->added = true;
+            }
+            any = true;
+            ++index;
+        }
+        guard.unlock ();
+        int runResult = any ? aria2::run (engine->session, aria2::RUN_ONCE) : 0;
+        guard.lock ();
+        if (runResult < 0) {
+            engine->failed.store (true);
+            engine_fail_all (*engine, EIO);
+            engine->stopping = true;
+            break;
+        }
+        for (size_t index = 0; index < engine->tasks.size ();) {
+            std::shared_ptr<DownloadEngineTask> task = engine->tasks[index];
+            bool keep;
+            try {
+                keep = engine_task_update (*engine, task);
+            } catch (const AdapterError& failure) {
+                /* Reuse the stop state machine: it removes owned GIDs and their
+                 * transitive children before reporting the failure, so a failed
+                 * task cannot keep downloading into a stage the core may delete. */
+                task->stopping = true;
+                task->stopPhase = DOWNLOAD_ENGINE_PHASE_FAILED;
+                task->stopError = failure.code;
+                for (aria2::A2Gid gid : owned_gids (*task))
+                    (void)aria2::removeDownload (engine->session, gid, true);
+                keep = true;
+            } catch (const std::bad_alloc&) {
+                task->stopping = true;
+                task->stopPhase = DOWNLOAD_ENGINE_PHASE_FAILED;
+                task->stopError = ENOMEM;
+                for (aria2::A2Gid gid : owned_gids (*task))
+                    (void)aria2::removeDownload (engine->session, gid, true);
+                keep = true;
+            } catch (...) {
+                task->stopping = true;
+                task->stopPhase = DOWNLOAD_ENGINE_PHASE_FAILED;
+                task->stopError = EIO;
+                for (aria2::A2Gid gid : owned_gids (*task))
+                    (void)aria2::removeDownload (engine->session, gid, true);
+                keep = true;
+            }
+            if (keep)
+                ++index;
+            else
+                engine->tasks.erase (engine->tasks.begin () + static_cast<std::ptrdiff_t> (index));
+        }
+    }
+}
+
+static void engine_loop (DownloadAriaEngine* engine)
+{
+    try {
+        engine_loop_body (engine);
+    } catch (...) {
+        engine->failed.store (true);
+    }
+}
+
+static void engine_stop ()
+{
+    DownloadAriaEngine& engine = engine_instance ();
+    {
+        DownloadEngineLock guard (&engine.mutex);
+        if (!engine.started) {
+            engine_cleanup_directory (engine);
+            if (engine.initialized) {
+                (void)aria2::libraryDeinit ();
+                engine.initialized = false;
+            }
+            return;
+        }
+        engine.stopping = true;
+        c_cond_notify_all (&engine.cond);
+    }
+    if (engine.thread.joinable ())
+        engine.thread.join ();
+    {
+        DownloadEngineLock guard (&engine.mutex);
+        engine.tasks.clear ();
+        engine.pending.clear ();
+        if (engine.session != NULL) {
+            aria2::Session* session = engine.session;
+            (void)aria2::shutdown (session, true);
+            for (int iteration = 0; iteration < 10; ++iteration) {
+                int result = aria2::run (session, aria2::RUN_ONCE);
+                if (result <= 0)
+                    break;
+            }
+            (void)aria2::sessionFinal (session);
+            engine.session = NULL;
+        }
+        if (engine.initialized) {
+            (void)aria2::libraryDeinit ();
+            engine.initialized = false;
+        }
+        engine_cleanup_directory (engine);
+        engine.started = false;
+        engine.stopping = false;
+    }
+}
+
+static void progress (ProtocolTask* task, uint64_t total, uint64_t completed, uint64_t speed)
+{
+    if (task->callbacks.onProgress)
+        task->callbacks.onProgress (task->userData, total, completed, speed);
+}
+
+static bool prepare_stage (ProtocolTask* task, std::string& stage, std::string& privateDirectory,
+                           std::string& fetched)
+{
     std::unique_ptr<char, void (*) (void*)> canonical (
         c_path_canonicalize (task->source.tempPath, NULL), c_free);
     require (canonical.get () != NULL, errno);
-    std::string stage = canonical.get ();
+    stage = canonical.get ();
     require (!stage.empty () && stage[0] == '/' && stage != "/", EINVAL);
     require (safe_relative (stage.substr (1)), EINVAL);
     if (c_directory_create_with_mode (stage.c_str (), 0700) != 0)
@@ -373,192 +961,134 @@ static int execute (ProtocolTask* task)
     require (resolvedResult != NULL, errno);
     stage = resolved;
     check_tree (stage);
-    std::string privateDirectory = stage + "/.downloader-aria";
+    privateDirectory = stage + "/.downloader-aria";
     if (c_directory_create_with_mode (privateDirectory.c_str (), 0700) != 0)
         require (errno == EEXIST, errno);
-    aria2::KeyVals options = {
-        { "no-conf", "true" }, { "no-netrc", "true" }, { "enable-rpc", "false" },
-        { "check-certificate", "true" }, { "dir", stage }, { "continue", "true" },
-        { "auto-file-renaming", "false" }, { "allow-overwrite", "false" },
-        { "check-integrity", "true" }, { "seed-time", "0" }, { "seed-ratio", "0.0" },
-        { "follow-torrent", "mem" }, { "follow-metalink", "mem" }, { "pause-metadata", "true" },
-        { "bt-load-saved-metadata", "false" },
-        { "bt-save-metadata", "false" }, { "bt-enable-lpd", "false" },
-        { "enable-dht", "true" }, { "enable-dht6", "false" },
-        { "dht-file-path", privateDirectory + "/dht" }, { "dht-file-path6", privateDirectory + "/dht6" },
-        { "max-download-result", "2147483647" }, { "auto-save-interval", "1" },
-        { "file-allocation", "none" }, { "console-log-level", "error" },
-        { "summary-interval", "0" }, { "download-result", "hide" }
-    };
-    aria2::SessionConfig config;
-    config.useSignalHandler = false;
-    config.keepRunning = true;
-    owner.session = aria2::sessionNew (options, config);
-    require (owner.session != NULL);
-    aria2::Session* session = owner.session;
-    std::string url = task->source.resourceUrl;
-    bool magnet = url.compare (0, 7, "magnet:") == 0;
-    bool metalink = strcmp (task->source.protocol, "metalink") == 0;
-    std::string announced;
-    std::string fetched = privateDirectory + "/descriptor";
-    std::vector<DownloadNode> nodes;
-    aria2::A2Gid descriptor = 0;
-    bool fetching = false;
-    if (magnet) {
-        aria2::A2Gid gid = 0;
-        require (aria2::addUri (session, &gid, { url }, { { "pause", "true" } }) == 0, EINVAL);
-        require (!aria2::isNull (gid), EINVAL);
-        nodes.push_back (DownloadNode (gid));
-        nodes.back ().metadata = true;
-    } else if (url.compare (0, 7, "file://") == 0) {
-        add_descriptor (session, local_metadata (url), metalink, nodes, "");
-    } else {
-        aria2::KeyVals fetchOptions = {
-            { "dir", privateDirectory }, { "out", "descriptor" },
-            { "follow-torrent", "false" }, { "follow-metalink", "false" },
-            { "enable-http-pipelining", "false" }
-        };
-        require (aria2::addUri (session, &descriptor, { url }, fetchOptions) == 0, EINVAL);
-        require (!aria2::isNull (descriptor), EINVAL);
-        fetching = true;
+    fetched = privateDirectory + "/descriptor";
+    return true;
+}
+
+static void finalize_stage (const std::string& stage, const std::string& privateDirectory,
+                            const std::string& fetched, bool fetchedDescriptor,
+                            const std::vector<std::string>& payloadFiles,
+                            const std::vector<std::string>& metadataFiles)
+{
+    check_tree (stage);
+    require (!payloadFiles.empty (), EINVAL);
+    for (const std::string& path : payloadFiles) {
+        struct stat status;
+        require_system (lstat (path.c_str (), &status));
+        require (S_ISREG (status.st_mode) && status.st_nlink == 1, EINVAL);
+    }
+    std::set<std::string> payloadSet (payloadFiles.begin (), payloadFiles.end ());
+    for (const std::string& path : metadataFiles) {
+        require (payloadSet.count (path) == 0, EINVAL);
+        remove_owned (path);
+        // A later child can legitimately be named descriptor.aria2.
+        if (payloadSet.count (path + ".aria2") == 0)
+            remove_owned (path + ".aria2");
+    }
+    if (fetchedDescriptor) {
+        remove_owned (fetched);
+        remove_owned (fetched + ".aria2");
+    }
+    /* Pre-upgrade adapters kept per-task DHT state inside this directory.
+     * Remove it so a resumed legacy stage can still commit. */
+    remove_owned (privateDirectory + "/dht");
+    remove_owned (privateDirectory + "/dht6");
+    remove_owned (privateDirectory + "/dht__temp");
+    remove_owned (privateDirectory + "/dht6__temp");
+    require_system (c_directory_remove (privateDirectory.c_str ()));
+}
+
+static int execute (ProtocolTask* task)
+{
+    DownloadAriaEngine& engine = engine_instance ();
+    std::string stage;
+    std::string privateDirectory;
+    std::string fetched;
+    prepare_stage (task, stage, privateDirectory, fetched);
+
+    std::shared_ptr<DownloadEngineTask> engineTask;
+    try {
+        engineTask.reset (new DownloadEngineTask ());
+    } catch (...) {
+        throw AdapterError (ENOMEM);
+    }
+    engineTask->url = task->source.resourceUrl;
+    engineTask->protocol = task->source.protocol;
+    engineTask->metalink = strcmp (task->source.protocol, "metalink") == 0;
+    engineTask->stage = stage;
+    engineTask->privateDirectory = privateDirectory;
+    engineTask->fetched = fetched;
+    bool magnet = std::string (task->source.resourceUrl).compare (0, 7, "magnet:") == 0;
+    engineTask->fetchedDescriptor =
+        !magnet && std::string (task->source.resourceUrl).compare (0, 7, "file://") != 0;
+    {
+        c_mutex_lock (&task->mutex);
+        engineTask->request = task->request;
+        task->engineTask = engineTask;
+        c_mutex_unlock (&task->mutex);
+    }
+    progress (task, task->source.totalBytes, task->source.downloadedBytes, 0);
+    if (engine_enqueue (engine, engineTask) != 0) {
+        c_mutex_lock (&task->mutex);
+        task->engineTask.reset ();
+        c_mutex_unlock (&task->mutex);
+        throw AdapterError (errno ? errno : EIO);
     }
     if (task->callbacks.onStarted)
         task->callbacks.onStarted (task->userData);
-    std::set<std::string> metadataFiles;
-    std::set<std::string> payloadFiles;
+
+    uint64_t seen = 0;
+    std::string announced;
     for (;;) {
-        if (request (task) != DOWNLOAD_ARIA_REQUEST_RUN) {
-            owner.finish ();
-            return request (task) == DOWNLOAD_ARIA_REQUEST_PAUSE ? 1 : -1;
+        DownloadEnginePhase phase;
+        int error;
+        uint64_t total, completed, speed;
+        bool hasFileName;
+        std::string fileName;
+        std::vector<std::string> payloadFiles;
+        std::vector<std::string> metadataFiles;
+        c_mutex_lock (&engineTask->mutex);
+        while (engineTask->generation == seen && !engine.failed.load ()) {
+            if (c_cond_wait_timeout (&engineTask->cond, &engineTask->mutex, 500) < 0)
+                break;
         }
-        if (fetching) {
-            Handle download = handle (session, descriptor);
-            require (download->getStatus () != aria2::DOWNLOAD_ERROR, EIO);
-            if (download->getStatus () == aria2::DOWNLOAD_COMPLETE) {
-                download.reset ();
-                add_descriptor (session, fetched, metalink, nodes, url);
-                fetching = false;
-            }
+        if (engineTask->generation == seen) {
+            c_mutex_unlock (&engineTask->mutex);
+            throw AdapterError (EIO);
         }
-        uint64_t total = 0, completed = 0, speed = 0;
-        bool done = !fetching && !nodes.empty ();
-        size_t payloadCount = 0;
-        payloadFiles.clear ();
-        std::set<std::string> controlFiles;
-        for (size_t index = 0; index < nodes.size (); ++index) {
-            Handle download = handle (session, nodes[index].gid);
-            std::vector<aria2::A2Gid> children = download->getFollowedBy ();
-            // Metalink metaurl torrents are auxiliary metadata with belongsTo,
-            // rather than followedBy. Their parent is the actual payload task.
-            aria2::A2Gid parent = download->getBelongsTo ();
-            bool auxiliary = !aria2::isNull (parent);
-            if (auxiliary) {
-                nodes[index].metadata = true;
-                append_nodes (nodes, { parent });
-            }
-            if (!children.empty ()) {
-                nodes[index].metadata = true;
-                append_nodes (nodes, children);
-            }
-            // Post-download parse errors can be swallowed by libaria2 while
-            // leaving the descriptor status COMPLETE. A recognized descriptor
-            // is never a terminal payload, even if no children were generated.
-            if (download->getInfoHash ().empty ()) {
-                for (const aria2::FileData& file : download->getFiles ()) {
-                    if (descriptor_path (file.path))
-                        nodes[index].metadata = true;
-                }
-            }
-            aria2::DownloadStatus status = download->getStatus ();
-            require (status != aria2::DOWNLOAD_ERROR && status != aria2::DOWNLOAD_REMOVED, EIO);
-            if (!nodes[index].checked) {
-                if (!nodes[index].metadata)
-                    validate_files (download.get (), stage);
-                if (status == aria2::DOWNLOAD_PAUSED)
-                    require (aria2::unpauseDownload (session, nodes[index].gid) == 0);
-                nodes[index].checked = true;
-            }
-            if (status != aria2::DOWNLOAD_COMPLETE)
-                done = false;
-            if (nodes[index].metadata) {
-                // Prefer memory, but aria2 may keep known-length followed
-                // descriptors on disk. Track only exact paths reported by a
-                // metadata node, never infer ownership from a file suffix.
-                for (const aria2::FileData& file : download->getFiles ()) {
-                    if (file.path.compare (0, stage.size () + 1, stage + "/") == 0) {
-                        require (safe_relative (file.path.substr (stage.size () + 1)), EPERM);
-                        metadataFiles.insert (file.path);
-                    }
-                }
-                if (status == aria2::DOWNLOAD_COMPLETE)
-                    require (auxiliary || !children.empty (), EINVAL);
-                continue;
-            }
-            ++payloadCount;
-            for (const aria2::FileData& file : download->getFiles ()) {
-                if (!file.path.empty ()) {
-                    payloadFiles.insert (file.path);
-                    // Multi-file torrents use <torrent-root>.aria2, outside
-                    // their nested payload directory but still inside stage.
-                    size_t slash = file.path.find ('/', stage.size () + 1);
-                    if (slash != std::string::npos && !download->getInfoHash ().empty ())
-                        controlFiles.insert (file.path.substr (0, slash) + ".aria2");
-                    else
-                        controlFiles.insert (file.path + ".aria2");
-                }
-            }
-            total += static_cast<uint64_t> (std::max<int64_t> (0, download->getTotalLength ()));
-            completed += static_cast<uint64_t> (std::max<int64_t> (0, download->getCompletedLength ()));
-            speed += static_cast<uint64_t> (std::max (0, download->getDownloadSpeed ()));
-            std::string name;
-            if (status == aria2::DOWNLOAD_ACTIVE || status == aria2::DOWNLOAD_WAITING || status == aria2::DOWNLOAD_PAUSED)
-                name = download->getBtMetaInfo ().name;
-            bool torrentName = !name.empty ();
-            if (name.empty ())
-                name = descriptor_name (url);
-            name = safe_name (name);
-            if (announced.empty () || (torrentName && name != announced)) {
-                announced = name;
+        seen = engineTask->generation;
+        phase = engineTask->phase;
+        error = engineTask->error;
+        total = engineTask->total;
+        completed = engineTask->completed;
+        speed = engineTask->speed;
+        hasFileName = engineTask->hasFileName;
+        fileName = engineTask->fileName;
+        payloadFiles = engineTask->payloadFiles;
+        metadataFiles = engineTask->metadataFiles;
+        c_mutex_unlock (&engineTask->mutex);
+
+        if (phase == DOWNLOAD_ENGINE_PHASE_RUNNING) {
+            progress (task, total, completed, speed);
+            if (hasFileName && fileName != announced) {
+                announced = fileName;
                 if (task->callbacks.onFileName)
-                    task->callbacks.onFileName (task->userData, name.c_str ());
+                    task->callbacks.onFileName (task->userData, fileName.c_str ());
             }
-        }
-        for (const std::string& control : controlFiles)
-            require (payloadFiles.count (control) == 0, EINVAL);
-        progress (task, total, completed, speed);
-        if (request (task) != DOWNLOAD_ARIA_REQUEST_RUN)
             continue;
-        if (done) {
-            require (payloadCount > 0, EINVAL);
-            owner.finish (true);
-            if (request (task) != DOWNLOAD_ARIA_REQUEST_RUN)
-                return request (task) == DOWNLOAD_ARIA_REQUEST_PAUSE ? 1 : -1;
-            check_tree (stage);
-            require (!payloadFiles.empty (), EINVAL);
-            for (const std::string& path : payloadFiles) {
-                struct stat status;
-                require_system (lstat (path.c_str (), &status));
-                require (S_ISREG (status.st_mode) && status.st_nlink == 1, EINVAL);
-            }
-            for (const std::string& path : metadataFiles) {
-                require (payloadFiles.count (path) == 0, EINVAL);
-                remove_owned (path);
-                // A later child can legitimately be named descriptor.aria2.
-                if (payloadFiles.count (path + ".aria2") == 0)
-                    remove_owned (path + ".aria2");
-            }
-            if (!magnet && url.compare (0, 7, "file://") != 0) {
-                remove_owned (fetched);
-                remove_owned (fetched + ".aria2");
-            }
-            remove_owned (privateDirectory + "/dht");
-            remove_owned (privateDirectory + "/dht6");
-            require_system (c_directory_remove (privateDirectory.c_str ()));
-            // aria2 itself removes successful payload control files. Never glob
-            // *.aria2: that suffix may be the user's actual payload filename.
-            return 0;
         }
-        require (aria2::run (session, aria2::RUN_ONCE) >= 0);
+        if (phase == DOWNLOAD_ENGINE_PHASE_PAUSED)
+            return 1;
+        if (phase == DOWNLOAD_ENGINE_PHASE_CANCELLED)
+            throw AdapterError (ECANCELED);
+        if (phase == DOWNLOAD_ENGINE_PHASE_FAILED)
+            throw AdapterError (error > 0 ? error : EIO);
+        finalize_stage (stage, privateDirectory, fetched, engineTask->fetchedDescriptor, payloadFiles,
+                        metadataFiles);
+        return 0;
     }
 }
 
@@ -582,13 +1112,13 @@ static int aria_open (ProtocolTask** result, const DownloadTask* source, const P
         errno = EINVAL;
         return -1;
     }
-    ProtocolTask* task = static_cast<ProtocolTask*> (c_malloc0 (sizeof (*task)));
+    ProtocolTask* task = new (std::nothrow) ProtocolTask ();
     if (!task) {
         errno = ENOMEM;
         return -1;
     }
-    if (!c_mutex_init (&task->mutex)) {
-        c_free (task);
+    if (!task->mutexReady) {
+        delete task;
         errno = ENOMEM;
         return -1;
     }
@@ -596,7 +1126,6 @@ static int aria_open (ProtocolTask** result, const DownloadTask* source, const P
     if (callbacks)
         task->callbacks = *callbacks;
     task->userData = userData;
-    task->request = DOWNLOAD_ARIA_REQUEST_RUN;
     *result = task;
     return 0;
 }
@@ -637,6 +1166,8 @@ static int aria_run (ProtocolTask* task)
 
 static int set_request (ProtocolTask* task, DownloadAriaRequest value)
 {
+    std::shared_ptr<DownloadEngineTask> engineTask;
+
     if (!task) {
         errno = EINVAL;
         return -1;
@@ -644,7 +1175,14 @@ static int set_request (ProtocolTask* task, DownloadAriaRequest value)
     c_mutex_lock (&task->mutex);
     if (task->request != DOWNLOAD_ARIA_REQUEST_CANCEL)
         task->request = value;
+    engineTask = task->engineTask;
     c_mutex_unlock (&task->mutex);
+    if (engineTask) {
+        c_mutex_lock (&engineTask->mutex);
+        if (engineTask->request != DOWNLOAD_ARIA_REQUEST_CANCEL)
+            engineTask->request = value;
+        c_mutex_unlock (&engineTask->mutex);
+    }
     return 0;
 }
 
@@ -654,9 +1192,25 @@ static int aria_cancel (ProtocolTask* task) { return set_request (task, DOWNLOAD
 
 static void aria_close (ProtocolTask* task)
 {
-    if (task) {
-        c_mutex_clear (&task->mutex);
-        c_free (task);
+    delete task;
+}
+
+static bool aria_retryable (ProtocolTask* task, int errorCode, const char* message)
+{
+    (void)task;
+    (void)message;
+    if (errorCode == EIO || errorCode == EAGAIN || errorCode == ETIMEDOUT || errorCode == ECONNRESET ||
+        errorCode == ECONNREFUSED || errorCode == EHOSTUNREACH || errorCode == ENETUNREACH ||
+        errorCode == ENETDOWN || errorCode == EPIPE || errorCode == ECONNABORTED)
+        return true;
+    return false;
+}
+
+static void aria_finish (void)
+{
+    try {
+        engine_stop ();
+    } catch (...) {
     }
 }
 } // namespace
@@ -664,7 +1218,8 @@ static void aria_close (ProtocolTask* task)
 extern "C" const ProtocolOps* aria_protocol_ops (void)
 {
     static const ProtocolOps operations = {
-        "aria2", aria_can_handle, aria_open, aria_run, aria_pause, aria_resume, aria_cancel, aria_close
+        "aria2", aria_can_handle, aria_open, aria_run, aria_pause, aria_resume, aria_cancel, NULL, aria_close,
+        aria_finish, aria_retryable, NULL
     };
     return &operations;
 }

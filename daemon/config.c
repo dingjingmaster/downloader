@@ -10,7 +10,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef DOWNLOADER_SYSTEM_CONFIG_PATH
 #define DOWNLOADER_SYSTEM_CONFIG_PATH "/etc/downloader/download.ini"
+#endif
 
 struct Config
 {
@@ -28,6 +30,21 @@ struct Config
     int32_t maxRetries;
     int32_t connectTimeout;
     int32_t transferTimeout;
+    char*   secretKeyFile;
+    char*   defaultAuthProfile;
+    char*   defaultProxyProfile;
+    char*   proxyUrl;
+    char*   proxyUsername;
+    char*   proxyPassword;
+    char*   webUsername;
+    char*   webPassword;
+    int32_t webSessionSeconds;
+    char*   baiduTransferDirectory;
+    int32_t baiduMaxParallelTasks;
+    int32_t baiduMaxFiles;
+    int32_t baiduSignCacheSeconds;
+    char*   baiduApiBase;
+    char*   baiduPcsBase;
 };
 
 static bool config_file_exists (const char* path)
@@ -171,7 +188,13 @@ static int config_load_values (Config* config, const CKeyFile* keyFile)
         return -1;
     if (config_get_int32 (keyFile, "web", "port", 8000, &config->webPort) != 0)
         return -1;
-    if (config_get_int32 (keyFile, "download", "max_concurrent_tasks", 3, &config->maxConcurrentTasks) != 0)
+    if (config_get_string (keyFile, "web", "username", "", &config->webUsername) != 0)
+        return -1;
+    if (config_get_string (keyFile, "web", "password", "", &config->webPassword) != 0)
+        return -1;
+    if (config_get_int32 (keyFile, "web", "session_seconds", 28800, &config->webSessionSeconds) != 0)
+        return -1;
+    if (config_get_int32 (keyFile, "download", "max_concurrent_tasks", 5, &config->maxConcurrentTasks) != 0)
         return -1;
     if (config_get_int32 (keyFile, "download", "max_retries", 3, &config->maxRetries) != 0)
         return -1;
@@ -179,9 +202,42 @@ static int config_load_values (Config* config, const CKeyFile* keyFile)
         return -1;
     if (config_get_int32 (keyFile, "download", "transfer_timeout", 0, &config->transferTimeout) != 0)
         return -1;
+    if (config_get_string (keyFile, "download", "secret_key_file", "", &config->secretKeyFile) != 0)
+        return -1;
+    if (config_get_string (keyFile, "auth", "default_profile", "", &config->defaultAuthProfile) != 0)
+        return -1;
+    if (config_get_string (keyFile, "proxy", "default_profile", "", &config->defaultProxyProfile) != 0)
+        return -1;
+    if (config_get_string (keyFile, "proxy", "url", "", &config->proxyUrl) != 0)
+        return -1;
+    if (config_get_string (keyFile, "proxy", "username", "", &config->proxyUsername) != 0)
+        return -1;
+    if (config_get_string (keyFile, "proxy", "password", "", &config->proxyPassword) != 0)
+        return -1;
+    if (config_get_string (keyFile, "baidu", "transfer_directory", "/downloader",
+                           &config->baiduTransferDirectory) != 0)
+        return -1;
+    if (config_get_int32 (keyFile, "baidu", "max_parallel_tasks", 2, &config->baiduMaxParallelTasks) != 0)
+        return -1;
+    if (config_get_int32 (keyFile, "baidu", "max_files", 2000, &config->baiduMaxFiles) != 0)
+        return -1;
+    if (config_get_int32 (keyFile, "baidu", "sign_cache_seconds", 3600, &config->baiduSignCacheSeconds) != 0)
+        return -1;
+    if (config_get_string (keyFile, "baidu", "api_base", "https://pan.baidu.com", &config->baiduApiBase) != 0)
+        return -1;
+    if (config_get_string (keyFile, "baidu", "pcs_base", "https://pcs.baidu.com", &config->baiduPcsBase) != 0)
+        return -1;
 
+    if ((config->webUsername[0] != '\0') != (config->webPassword[0] != '\0')) {
+        /* Enabling auth with only one half would silently leave the API open. */
+        errno = EINVAL;
+        return -1;
+    }
     if (config->maxConcurrentTasks <= 0 || config->maxRetries < 0 || config->connectTimeout < 0 ||
-        config->transferTimeout < 0 || config->webListen[0] == '\0' || config->webPort < 1 || config->webPort > 65535) {
+        config->transferTimeout < 0 || config->webListen[0] == '\0' || config->webPort < 1 || config->webPort > 65535 ||
+        config->baiduTransferDirectory[0] != '/' || config->baiduMaxParallelTasks <= 0 ||
+        config->baiduMaxFiles <= 0 || config->baiduSignCacheSeconds < 0 || config->baiduApiBase[0] == '\0' ||
+        config->baiduPcsBase[0] == '\0') {
         errno = EINVAL;
         return -1;
     }
@@ -243,6 +299,17 @@ void config_free (Config* config)
     c_free (config->tempSuffix);
     c_free (config->overwritePolicy);
     c_free (config->webListen);
+    c_free (config->secretKeyFile);
+    c_free (config->defaultAuthProfile);
+    c_free (config->defaultProxyProfile);
+    c_free (config->proxyUrl);
+    c_free (config->proxyUsername);
+    c_free (config->proxyPassword);
+    c_free (config->webUsername);
+    c_free (config->webPassword);
+    c_free (config->baiduTransferDirectory);
+    c_free (config->baiduApiBase);
+    c_free (config->baiduPcsBase);
     c_free (config);
 }
 
@@ -260,3 +327,21 @@ int32_t config_max_concurrent_tasks (const Config* config) { return config == NU
 int32_t config_max_retries (const Config* config) { return config == NULL ? 0 : config->maxRetries; }
 int32_t config_connect_timeout (const Config* config) { return config == NULL ? 0 : config->connectTimeout; }
 int32_t config_transfer_timeout (const Config* config) { return config == NULL ? 0 : config->transferTimeout; }
+const char* config_secret_key_file (const Config* config) { return config == NULL ? NULL : config->secretKeyFile; }
+const char* config_default_auth_profile (const Config* config) { return config == NULL ? NULL : config->defaultAuthProfile; }
+const char* config_default_proxy_profile (const Config* config) { return config == NULL ? NULL : config->defaultProxyProfile; }
+const char* config_proxy_url (const Config* config) { return config == NULL ? NULL : config->proxyUrl; }
+const char* config_proxy_username (const Config* config) { return config == NULL ? NULL : config->proxyUsername; }
+const char* config_proxy_password (const Config* config) { return config == NULL ? NULL : config->proxyPassword; }
+const char* config_web_username (const Config* config) { return config == NULL ? NULL : config->webUsername; }
+const char* config_web_password (const Config* config) { return config == NULL ? NULL : config->webPassword; }
+int32_t config_web_session_seconds (const Config* config) { return config == NULL ? 0 : config->webSessionSeconds; }
+const char* config_baidu_transfer_directory (const Config* config)
+{
+    return config == NULL ? NULL : config->baiduTransferDirectory;
+}
+int32_t config_baidu_max_parallel_tasks (const Config* config) { return config == NULL ? 0 : config->baiduMaxParallelTasks; }
+int32_t config_baidu_max_files (const Config* config) { return config == NULL ? 0 : config->baiduMaxFiles; }
+int32_t config_baidu_sign_cache_seconds (const Config* config) { return config == NULL ? 0 : config->baiduSignCacheSeconds; }
+const char* config_baidu_api_base (const Config* config) { return config == NULL ? NULL : config->baiduApiBase; }
+const char* config_baidu_pcs_base (const Config* config) { return config == NULL ? NULL : config->baiduPcsBase; }

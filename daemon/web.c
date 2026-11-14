@@ -97,14 +97,29 @@ static int web_status_reason (int status, const char** reason)
     case 400:
         *reason = "Bad Request";
         return 0;
+    case 401:
+        *reason = "Unauthorized";
+        return 0;
+    case 403:
+        *reason = "Forbidden";
+        return 0;
     case 404:
         *reason = "Not Found";
         return 0;
     case 405:
         *reason = "Method Not Allowed";
         return 0;
+    case 409:
+        *reason = "Conflict";
+        return 0;
+    case 413:
+        *reason = "Payload Too Large";
+        return 0;
     case 500:
         *reason = "Internal Server Error";
+        return 0;
+    case 502:
+        *reason = "Bad Gateway";
         return 0;
     case 503:
         *reason = "Service Unavailable";
@@ -127,11 +142,29 @@ static int web_send_response (int clientFd, const WebResponse* response)
     if (web_status_reason (response->status, &reason) != 0)
         return -1;
     headerSize = snprintf (header, sizeof (header),
-                           "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+                           "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n",
                            response->status, reason, contentType, bodySize);
     if (headerSize < 0 || (size_t)headerSize >= sizeof (header)) {
         errno = ENOSPC;
         return -1;
+    }
+    if (response->setCookie[0] != '\0') {
+        int written = snprintf (header + headerSize, sizeof (header) - (size_t)headerSize, "Set-Cookie: %s\r\n",
+                                response->setCookie);
+        if (written < 0 || (size_t)written >= sizeof (header) - (size_t)headerSize) {
+            errno = ENOSPC;
+            return -1;
+        }
+        headerSize += written;
+    }
+    {
+        int written = snprintf (header + headerSize, sizeof (header) - (size_t)headerSize,
+                                "Connection: close\r\n\r\n");
+        if (written < 0 || (size_t)written >= sizeof (header) - (size_t)headerSize) {
+            errno = ENOSPC;
+            return -1;
+        }
+        headerSize += written;
     }
     while (sent < (size_t)headerSize) {
         ssize_t written = send (clientFd, header + sent, (size_t)headerSize - sent, MSG_NOSIGNAL);
@@ -272,6 +305,36 @@ static char* web_find_header_end (char* request, size_t requestSize)
     return NULL;
 }
 
+/* One pass: terminating one header line must not hide later lines from a
+ * second lookup. Values point into the request buffer. */
+static void web_parse_auth_headers (char* headers, const char** cookie, const char** csrf)
+{
+    char* line = headers;
+
+    *cookie = "";
+    *csrf = "";
+    while (line != NULL && *line != '\0') {
+        char*  end = strstr (line, "\r\n");
+        size_t lineSize = end == NULL ? strlen (line) : (size_t)(end - line);
+        bool   cookieLine = lineSize > 6U && strncasecmp (line, "Cookie", 6U) == 0 && line[6] == ':';
+        bool   csrfLine = lineSize > 12U && strncasecmp (line, "X-CSRF-Token", 12U) == 0 && line[12] == ':';
+        if (cookieLine || csrfLine) {
+            char* value = line + (cookieLine ? 7U : 13U);
+            char* valueEnd = line + lineSize;
+            while (*value == ' ' || *value == '\t')
+                value++;
+            while (valueEnd > value && (valueEnd[-1] == ' ' || valueEnd[-1] == '\t'))
+                valueEnd--;
+            *valueEnd = '\0';
+            if (cookieLine)
+                *cookie = value;
+            else
+                *csrf = value;
+        }
+        line = end == NULL ? NULL : end + 2;
+    }
+}
+
 static int web_parse_content_length (const char* headers, size_t* contentLength)
 {
     const char* marker = "Content-Length:";
@@ -379,6 +442,7 @@ static int web_handle_client (Web* web, int clientFd)
     request.query = query;
     request.body = headerEnd + 4;
     request.bodySize = contentLength;
+    web_parse_auth_headers (requestLineEnd + 2, &request.cookie, &request.csrfToken);
     result = web_load_static (web, request.path, &response);
     if (result < 0) {
         free (method);

@@ -23,6 +23,8 @@ typedef struct
     const char* query;
     const char* body;
     size_t      bodySize;
+    const char* cookie;
+    const char* csrfToken;
 } WebRequest;
 
 typedef struct
@@ -32,6 +34,7 @@ typedef struct
     const char* body;
     size_t      bodySize;
     bool        bodyOwned;
+    char        setCookie[256];
 } WebResponse;
 
 typedef int (*WebRequestHandler) (const WebRequest* request, WebResponse* response, void* userData);

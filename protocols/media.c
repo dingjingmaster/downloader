@@ -1,6 +1,9 @@
 #define _POSIX_C_SOURCE 200809L
 #include "media.h"
+#include "media-drm.h"
 
+#include <clib/directory.h>
+#include <clib/json.h>
 #include <clib/memory.h>
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -12,6 +15,7 @@
 #include <libavutil/time.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
+#include <openssl/evp.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -28,7 +32,8 @@ typedef enum
 {
     DOWNLOAD_MEDIA_RUNNING,
     DOWNLOAD_MEDIA_PAUSED,
-    DOWNLOAD_MEDIA_CANCELLED
+    DOWNLOAD_MEDIA_CANCELLED,
+    DOWNLOAD_MEDIA_STOP
 } DownloadMediaControl;
 
 struct ProtocolTask
@@ -48,6 +53,13 @@ struct ProtocolTask
     uint64_t             networkBytes;
     int64_t              startedAt;
     int64_t              notifiedAt;
+    int64_t              lastRecordingNotify;
+    int64_t              durationMillis;
+    uint32_t             gapCount;
+    uint32_t             recordDurationSeconds;
+    uint64_t             recordSizeBytes;
+    bool                 live;
+    char                 cacheDirectory[DOWNLOAD_TASK_PATH_SIZE];
 };
 
 typedef struct
@@ -58,6 +70,12 @@ typedef struct
     size_t        prefixLength;
     size_t        prefixPosition;
     bool          manifest;
+    FILE*         cacheRead;
+    FILE*         cacheWrite;
+    char          cacheFinal[DOWNLOAD_TASK_PATH_SIZE];
+    char          cachePart[DOWNLOAD_TASK_PATH_SIZE];
+    uint64_t      cacheBytes;
+    uint64_t      expectedSize;
 } MediaInput;
 
 /* Preserve FFmpeg's AVOption traversal through our custom AVIO layer. HLS
@@ -88,6 +106,25 @@ static const char* media_source_url (const char* url)
     return url;
 }
 
+static bool media_manifest_url (const char* url)
+{
+    size_t length = strcspn (url, "?#");
+
+    return (length >= 5 && strncasecmp (url + length - 5, ".m3u8", 5) == 0) ||
+           (length >= 4 && strncasecmp (url + length - 4, ".m3u", 4) == 0) ||
+           (length >= 4 && strncasecmp (url + length - 4, ".mpd", 4) == 0);
+}
+
+static bool media_segment_url (const char* url)
+{
+    size_t length = strcspn (url, "?#");
+
+    return (length >= 3 && strncasecmp (url + length - 3, ".ts", 3) == 0) ||
+           (length >= 4 && strncasecmp (url + length - 4, ".m4s", 4) == 0) ||
+           (length >= 4 && strncasecmp (url + length - 4, ".m4a", 4) == 0) ||
+           (length >= 5 && strncasecmp (url + length - 5, ".m4v", 5) == 0);
+}
+
 static bool media_can_handle (const char* url, const char* protocol)
 {
     return protocol != NULL && (strcmp (protocol, "hls") == 0 || strcmp (protocol, "dash") == 0) &&
@@ -108,6 +145,11 @@ static void media_progress (ProtocolTask* task, bool force, bool complete)
                                         task->writtenLength, speed);
         task->notifying = false;
     }
+    if (task->live && task->callbacks.onRecording != NULL &&
+        (force || now - task->lastRecordingNotify >= 1000000)) {
+        task->lastRecordingNotify = now;
+        task->callbacks.onRecording (task->userData, task->durationMillis, task->gapCount);
+    }
 }
 
 static int media_interrupt (void* opaque)
@@ -127,15 +169,81 @@ static int media_network_failure (ProtocolTask* task, int result, const char* de
     return result;
 }
 
-static bool media_xml_protected (xmlNode* node)
+static bool media_contains_ci (const char* value, const char* needle)
 {
-    for (; node != NULL; node = node->next) {
-        if (node->type == XML_ELEMENT_NODE && xmlStrEqual (node->name, BAD_CAST "ContentProtection"))
-            return true;
-        if (media_xml_protected (node->children))
+    size_t needleLength = strlen (needle);
+
+    for (const char* cursor = value; *cursor != '\0'; cursor++) {
+        if (strncasecmp (cursor, needle, needleLength) == 0)
             return true;
     }
     return false;
+}
+
+DownloadMediaDrm media_drm_from_scheme_id (const char* schemeIdUri)
+{
+    if (schemeIdUri == NULL || schemeIdUri[0] == '\0')
+        return DOWNLOAD_MEDIA_DRM_NONE;
+    if (media_contains_ci (schemeIdUri, "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed") ||
+        media_contains_ci (schemeIdUri, "widevine"))
+        return DOWNLOAD_MEDIA_DRM_WIDEVINE;
+    if (media_contains_ci (schemeIdUri, "9a04f079-9840-4286-ab92-e65be0885f95") ||
+        media_contains_ci (schemeIdUri, "playready"))
+        return DOWNLOAD_MEDIA_DRM_PLAYREADY;
+    if (media_contains_ci (schemeIdUri, "94ce86fb-07ff-4f43-adb8-93d2fa968ca2") ||
+        media_contains_ci (schemeIdUri, "fairplay"))
+        return DOWNLOAD_MEDIA_DRM_FAIRPLAY;
+    if (media_contains_ci (schemeIdUri, "sample-aes"))
+        return DOWNLOAD_MEDIA_DRM_SAMPLE_AES;
+    return DOWNLOAD_MEDIA_DRM_UNKNOWN;
+}
+
+DownloadMediaDrm media_drm_from_keyformat (const char* keyFormat)
+{
+    if (keyFormat == NULL || keyFormat[0] == '\0')
+        return DOWNLOAD_MEDIA_DRM_UNKNOWN;
+    DownloadMediaDrm system = media_drm_from_scheme_id (keyFormat);
+    return system == DOWNLOAD_MEDIA_DRM_NONE ? DOWNLOAD_MEDIA_DRM_UNKNOWN : system;
+}
+
+const char* media_drm_name (DownloadMediaDrm system)
+{
+    switch (system) {
+    case DOWNLOAD_MEDIA_DRM_WIDEVINE:
+        return "Widevine";
+    case DOWNLOAD_MEDIA_DRM_PLAYREADY:
+        return "PlayReady";
+    case DOWNLOAD_MEDIA_DRM_FAIRPLAY:
+        return "FairPlay";
+    case DOWNLOAD_MEDIA_DRM_SAMPLE_AES:
+        return "SAMPLE-AES";
+    case DOWNLOAD_MEDIA_DRM_UNKNOWN:
+        return "unknown DRM";
+    case DOWNLOAD_MEDIA_DRM_NONE:
+        break;
+    }
+    return "none";
+}
+
+static DownloadMediaDrm media_drm_from_xml (xmlNode* node)
+{
+    for (; node != NULL; node = node->next) {
+        if (node->type == XML_ELEMENT_NODE && xmlStrEqual (node->name, BAD_CAST "ContentProtection")) {
+            xmlChar* scheme = xmlGetProp (node, BAD_CAST "schemeIdUri");
+            /* Any ContentProtection is unsupported, including a missing or
+             * unrecognized scheme; never treat it as clear content. */
+            DownloadMediaDrm system = scheme == NULL || scheme[0] == '\0'
+                                          ? DOWNLOAD_MEDIA_DRM_UNKNOWN
+                                          : media_drm_from_scheme_id ((const char*)scheme);
+            xmlFree (scheme);
+            if (system != DOWNLOAD_MEDIA_DRM_NONE)
+                return system;
+        }
+        DownloadMediaDrm child = media_drm_from_xml (node->children);
+        if (child != DOWNLOAD_MEDIA_DRM_NONE)
+            return child;
+    }
+    return DOWNLOAD_MEDIA_DRM_NONE;
 }
 
 /* AES-128 identity keys are ordinary HLS encryption, not SAMPLE-AES/DRM.
@@ -151,6 +259,9 @@ static int media_validate_hls_keys (ProtocolTask* task, const char* manifest)
             bool methodSeen = false;
             bool formatSeen = false;
             bool supported = true;
+            bool sampleAes = false;
+            const char* keyFormatValue = NULL;
+            size_t keyFormatLength = 0;
             while (cursor < end) {
                 const char* name = cursor;
                 while (cursor < end && *cursor != '=')
@@ -169,11 +280,16 @@ static int media_validate_hls_keys (ProtocolTask* task, const char* manifest)
                     cursor++;
                 size_t valueLength = (size_t)(cursor - value);
                 if (nameLength == 6 && memcmp (name, "METHOD", 6) == 0) {
+                    sampleAes = valueLength >= 10 && strncasecmp (value, "SAMPLE-AES", 10) == 0;
                     supported = supported && !methodSeen && !quoted &&
                                 ((valueLength == 7 && memcmp (value, "AES-128", 7) == 0) ||
                                  (valueLength == 4 && memcmp (value, "NONE", 4) == 0));
                     methodSeen = true;
                 } else if (nameLength == 9 && memcmp (name, "KEYFORMAT", 9) == 0) {
+                    if (quoted) {
+                        keyFormatValue = value;
+                        keyFormatLength = valueLength;
+                    }
                     supported = supported && !formatSeen && quoted && valueLength == 8 &&
                                 memcmp (value, "identity", 8) == 0;
                     formatSeen = true;
@@ -191,9 +307,20 @@ static int media_validate_hls_keys (ProtocolTask* task, const char* manifest)
                 }
             }
             supported = supported && methodSeen;
-            if (!supported)
-                return media_network_failure (task, AVERROR (ENOTSUP),
-                                               "HLS SAMPLE-AES/DRM or unknown key method is unsupported");
+            if (!supported) {
+                DownloadMediaDrm drm = DOWNLOAD_MEDIA_DRM_UNKNOWN;
+                char format[DOWNLOAD_TASK_ERROR_SIZE];
+                if (sampleAes) {
+                    drm = DOWNLOAD_MEDIA_DRM_SAMPLE_AES;
+                } else if (keyFormatValue != NULL && keyFormatLength < sizeof (format)) {
+                    memcpy (format, keyFormatValue, keyFormatLength);
+                    format[keyFormatLength] = '\0';
+                    drm = media_drm_from_keyformat (format);
+                }
+                char detail[DOWNLOAD_TASK_ERROR_SIZE];
+                snprintf (detail, sizeof (detail), "DRM %s is not supported", media_drm_name (drm));
+                return media_network_failure (task, AVERROR (ENOTSUP), detail);
+            }
         }
         line += length;
         while (*line == '\r' || *line == '\n')
@@ -208,9 +335,11 @@ static int media_validate_manifest (ProtocolTask* task, const unsigned char* man
         int result = media_validate_hls_keys (task, (const char*)manifest);
         if (result < 0)
             return result;
-        if (strstr ((const char*)manifest, "#EXT-X-STREAM-INF:") == NULL &&
+        /* Only a media playlist decides liveness, and once live the task stays
+         * a recording even if the playlist later gains ENDLIST. */
+        if (strstr ((const char*)manifest, "#EXTINF:") != NULL &&
             strstr ((const char*)manifest, "#EXT-X-ENDLIST") == NULL)
-            return media_network_failure (task, AVERROR (ENOTSUP), "Live or unfinished HLS playlists are unsupported");
+            task->live = true;
         return 0;
     }
     xmlDoc* document = xmlReadMemory ((const char*)manifest, (int)length, NULL, NULL,
@@ -222,11 +351,187 @@ static int media_validate_manifest (ProtocolTask* task, const unsigned char* man
         result = media_network_failure (task, AVERROR (ENOTSUP), "Unsupported DASH manifest (DTD is forbidden)");
     } else {
         xmlChar* type = xmlGetProp (root, BAD_CAST "type");
-        if ((type != NULL && !xmlStrEqual (type, BAD_CAST "static")) || media_xml_protected (root))
-            result = media_network_failure (task, AVERROR (ENOTSUP), "Live DASH or DRM ContentProtection is unsupported");
+        DownloadMediaDrm drm = media_drm_from_xml (root);
+        if (drm != DOWNLOAD_MEDIA_DRM_NONE) {
+            char detail[DOWNLOAD_TASK_ERROR_SIZE];
+            snprintf (detail, sizeof (detail), "DRM %s is not supported", media_drm_name (drm));
+            result = media_network_failure (task, AVERROR (ENOTSUP), detail);
+        } else {
+            task->live = type != NULL && !xmlStrEqual (type, BAD_CAST "static");
+        }
         xmlFree (type);
     }
     xmlFreeDoc (document);
+    return result;
+}
+
+/* Segments and manifests are cached by URL plus byte-range options, so a
+ * resumed run replays completed resources from disk instead of the network.
+ * Only a resource read to EOF is promoted to the final cache name; partially
+ * read resources are re-fetched. Encryption keys (crypto+) are never cached. */
+static bool media_cache_key (const char* url, const AVDictionary* options, char* key, size_t capacity)
+{
+    static const char* const rangeKeys[] = { "offset", "end_offset", "range" };
+    EVP_MD_CTX*   context = EVP_MD_CTX_new ();
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int  digestLength = 0;
+    bool          result = false;
+
+    if (context == NULL)
+        return false;
+    if (EVP_DigestInit_ex (context, EVP_sha256 (), NULL) != 1 ||
+        EVP_DigestUpdate (context, url, strlen (url)) != 1)
+        goto done;
+    for (size_t index = 0; index < sizeof (rangeKeys) / sizeof (rangeKeys[0]); index++) {
+        AVDictionaryEntry* entry = options == NULL ? NULL : av_dict_get (options, rangeKeys[index], NULL, 0);
+        if (entry == NULL)
+            continue;
+        if (EVP_DigestUpdate (context, rangeKeys[index], strlen (rangeKeys[index])) != 1 ||
+            EVP_DigestUpdate (context, "=", 1) != 1 ||
+            EVP_DigestUpdate (context, entry->value, strlen (entry->value)) != 1 ||
+            EVP_DigestUpdate (context, ";", 1) != 1)
+            goto done;
+    }
+    if (EVP_DigestFinal_ex (context, digest, &digestLength) != 1 || capacity < digestLength * 2U + 1U)
+        goto done;
+    for (unsigned int index = 0; index < digestLength; index++)
+        snprintf (key + index * 2U, 3U, "%02x", digest[index]);
+    key[digestLength * 2U] = '\0';
+    result = true;
+done:
+    EVP_MD_CTX_free (context);
+    return result;
+}
+
+static void media_cache_finish (MediaInput* input)
+{
+    bool ok = true;
+
+    if (input->cacheWrite == NULL)
+        return;
+    if (fflush (input->cacheWrite) != 0 || fsync (fileno (input->cacheWrite)) != 0)
+        ok = false;
+    if (fclose (input->cacheWrite) != 0)
+        ok = false;
+    input->cacheWrite = NULL;
+    if (!ok) {
+        if (input->owner->networkError == 0)
+            input->owner->networkError = errno != 0 ? errno : EIO;
+        (void)unlink (input->cachePart);
+        return;
+    }
+    if (rename (input->cachePart, input->cacheFinal) != 0 && input->owner->networkError == 0)
+        input->owner->networkError = errno != 0 ? errno : EIO;
+}
+
+static bool media_cache_write (MediaInput* input, const unsigned char* data, size_t size)
+{
+    if (input->cacheWrite == NULL)
+        return true;
+    if (fwrite (data, 1, size, input->cacheWrite) != size) {
+        if (input->owner->networkError == 0)
+            input->owner->networkError = errno != 0 ? errno : ENOSPC;
+        return false;
+    }
+    return true;
+}
+
+static uint64_t media_option_u64 (const AVDictionary* options, const char* key, bool* present)
+{
+    AVDictionaryEntry* entry = options == NULL ? NULL : av_dict_get (options, key, NULL, 0);
+    char*              end = NULL;
+    unsigned long long value;
+
+    *present = false;
+    if (entry == NULL)
+        return 0;
+    errno = 0;
+    value = strtoull (entry->value, &end, 10);
+    if (errno != 0 || end == entry->value)
+        return 0;
+    *present = true;
+    return (uint64_t)value;
+}
+
+static void media_cache_open (ProtocolTask* task, MediaInput* input, const char* url,
+                              const AVDictionary* options)
+{
+    char key[EVP_MAX_MD_SIZE * 2U + 1U];
+    bool hasOffset = false;
+    bool hasEnd = false;
+    uint64_t offset = media_option_u64 (options, "offset", &hasOffset);
+    uint64_t end = media_option_u64 (options, "end_offset", &hasEnd);
+    char final[DOWNLOAD_TASK_PATH_SIZE];
+    char part[DOWNLOAD_TASK_PATH_SIZE];
+    int  descriptor;
+
+    if (task->cacheDirectory[0] == '\0' || strncmp (url, "crypto+", 7) == 0 ||
+        media_manifest_url (url) || !media_cache_key (url, options, key, sizeof (key)))
+        return;
+    if (hasOffset && hasEnd && end > offset)
+        input->expectedSize = end - offset;
+    if (snprintf (final, sizeof (final), "%s/%s", task->cacheDirectory, key) >= (int)sizeof (final) ||
+        snprintf (part, sizeof (part), "%s/%s.part", task->cacheDirectory, key) >= (int)sizeof (part))
+        return;
+    descriptor = open (final, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor >= 0) {
+        struct stat status;
+        if (fstat (descriptor, &status) == 0 && S_ISREG (status.st_mode) && status.st_nlink == 1) {
+            input->cacheRead = fdopen (descriptor, "rb");
+            if (input->cacheRead != NULL) {
+                snprintf (input->cacheFinal, sizeof (input->cacheFinal), "%s", final);
+                return;
+            }
+        }
+        (void)close (descriptor);
+    }
+    descriptor = open (part, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (descriptor >= 0) {
+        struct stat status;
+        if (fstat (descriptor, &status) == 0 && S_ISREG (status.st_mode) && status.st_nlink == 1) {
+            input->cacheWrite = fdopen (descriptor, "wb");
+            if (input->cacheWrite != NULL) {
+                snprintf (input->cacheFinal, sizeof (input->cacheFinal), "%s", final);
+                snprintf (input->cachePart, sizeof (input->cachePart), "%s", part);
+                return;
+            }
+        }
+        (void)close (descriptor);
+    }
+}
+
+static int media_stream_read (MediaInput* input, unsigned char* buffer, int size)
+{
+    int result;
+
+    if (input->cacheRead != NULL) {
+        size_t count = fread (buffer, 1, (size_t)size, input->cacheRead);
+        if (count > 0)
+            return (int)count;
+        return ferror (input->cacheRead) ? AVERROR (errno != 0 ? errno : EIO) : AVERROR_EOF;
+    }
+    result = avio_read (input->remote, buffer, size);
+    if (result > 0) {
+        input->owner->networkBytes += (uint64_t)result;
+        input->cacheBytes += (uint64_t)result;
+        if (!media_cache_write (input, buffer, (size_t)result))
+            return AVERROR (input->owner->networkError);
+        if (input->expectedSize > 0 && input->cacheBytes >= input->expectedSize)
+            media_cache_finish (input);
+    } else if (result == AVERROR_EOF) {
+        media_cache_finish (input);
+    } else {
+        /* A ranged resource is complete once its declared size arrived; the
+         * HTTP layer may still report a range-boundary read error. */
+        if (input->expectedSize > 0 && input->cacheBytes >= input->expectedSize) {
+            media_cache_finish (input);
+            return AVERROR_EOF;
+        }
+        media_network_failure (input->owner, result, "Media segment read failed or was truncated");
+    }
+    if (input->remote->error < 0 && input->remote->error != AVERROR_EOF &&
+        !(input->expectedSize > 0 && input->cacheBytes >= input->expectedSize))
+        media_network_failure (input->owner, input->remote->error, "Media HTTP transfer ended prematurely");
     return result;
 }
 
@@ -245,19 +550,22 @@ static int media_input_read (void* opaque, uint8_t* buffer, int size)
     }
     if (input->manifest)
         return AVERROR_EOF;
-    int result = avio_read (input->remote, buffer, size);
-    if (result > 0)
-        input->owner->networkBytes += (uint64_t)result;
-    if (result < 0 && result != AVERROR_EOF)
-        media_network_failure (input->owner, result, "Media segment read failed or was truncated");
-    if (input->remote->error < 0 && input->remote->error != AVERROR_EOF)
-        media_network_failure (input->owner, input->remote->error, "Media HTTP transfer ended prematurely");
-    return result;
+    return media_stream_read (input, buffer, size);
 }
 
 static int64_t media_input_seek (void* opaque, int64_t offset, int whence)
 {
     MediaInput* input = opaque;
+    if (input->cacheRead != NULL) {
+        if (whence == AVSEEK_SIZE) {
+            struct stat status;
+            return fstat (fileno (input->cacheRead), &status) == 0 ? (int64_t)status.st_size : AVERROR (errno);
+        }
+        if (fseeko (input->cacheRead, (off_t)offset, whence & ~AVSEEK_FORCE) != 0)
+            return AVERROR (errno);
+        off_t position = ftello (input->cacheRead);
+        return position < 0 ? AVERROR (errno) : position;
+    }
     if (whence == AVSEEK_SIZE)
         return input->manifest ? (int64_t)input->prefixLength : avio_size (input->remote);
     /* Sequential segment consumption; retaining the probe prefix must not cause
@@ -269,7 +577,23 @@ static int64_t media_input_seek (void* opaque, int64_t offset, int whence)
 static int media_input_close (AVFormatContext* format, AVIOContext* stream)
 {
     MediaInput* input = stream->opaque;
-    int result = avio_closep (&input->remote);
+    int result = 0;
+    if (input->cacheRead != NULL) {
+        if (fclose (input->cacheRead) != 0)
+            result = AVERROR (errno != 0 ? errno : EIO);
+        input->cacheRead = NULL;
+    }
+    if (input->cacheWrite != NULL) {
+        /* Closed before EOF: the .part file is not a completed resource. */
+        if (fclose (input->cacheWrite) != 0 && result == 0)
+            result = AVERROR (errno != 0 ? errno : EIO);
+        input->cacheWrite = NULL;
+    }
+    if (input->remote != NULL) {
+        int closed = avio_closep (&input->remote);
+        if (closed < 0 && result == 0)
+            result = closed;
+    }
     (void)format;
     c_free (input->prefix);
     c_free (input);
@@ -296,6 +620,7 @@ static int media_input_open (AVFormatContext* format, AVIOContext** stream, cons
     if (input == NULL)
         return media_network_failure (task, AVERROR (ENOMEM), "Cannot allocate media input");
     input->owner = task;
+    media_cache_open (task, input, url, options != NULL ? *options : NULL);
     result = av_dict_copy (&settings, options != NULL ? *options : NULL, 0);
     if (result < 0)
         goto failed;
@@ -307,20 +632,23 @@ static int media_input_open (AVFormatContext* format, AVIOContext** stream, cons
     DOWNLOADER_MEDIA_OPTION ("timeout", "15000000");
     DOWNLOADER_MEDIA_OPTION ("http_persistent", "0");
 #undef DOWNLOADER_MEDIA_OPTION
-    result = avio_open2 (&input->remote, url, AVIO_FLAG_READ, &interrupt, &settings);
-    av_dict_free (&settings);
-    if (result < 0)
-        goto failed;
+    if (input->cacheRead == NULL) {
+        result = avio_open2 (&input->remote, url, AVIO_FLAG_READ, &interrupt, &settings);
+        av_dict_free (&settings);
+        if (result < 0)
+            goto failed;
+    } else {
+        av_dict_free (&settings);
+    }
     input->prefix = c_malloc (513);
     if (input->prefix == NULL) {
         result = AVERROR (ENOMEM);
         goto failed;
     }
-    result = avio_read (input->remote, input->prefix, 512);
+    result = media_stream_read (input, input->prefix, 512);
     if (result < 0)
         goto failed;
     input->prefixLength = (size_t)result;
-    task->networkBytes += (uint64_t)result;
     input->prefix[input->prefixLength] = 0;
     const unsigned char* start = input->prefix;
     if (input->prefixLength >= 3 && memcmp (start, "\xef\xbb\xbf", 3) == 0)
@@ -341,8 +669,8 @@ static int media_input_open (AVFormatContext* format, AVIOContext** stream, cons
         input->prefix = expanded;
         start = input->prefix + leading;
         while (input->prefixLength < DOWNLOADER_MEDIA_MANIFEST_LIMIT) {
-            result = avio_read (input->remote, input->prefix + input->prefixLength,
-                                DOWNLOADER_MEDIA_MANIFEST_LIMIT - (int)input->prefixLength);
+            result = media_stream_read (input, input->prefix + input->prefixLength,
+                                        DOWNLOADER_MEDIA_MANIFEST_LIMIT - (int)input->prefixLength);
             if (result == AVERROR_EOF)
                 break;
             if (result < 0)
@@ -350,7 +678,6 @@ static int media_input_open (AVFormatContext* format, AVIOContext** stream, cons
             if (result == 0)
                 break;
             input->prefixLength += (size_t)result;
-            task->networkBytes += (uint64_t)result;
         }
         if (input->prefixLength == DOWNLOADER_MEDIA_MANIFEST_LIMIT) {
             result = AVERROR (EFBIG);
@@ -361,7 +688,7 @@ static int media_input_open (AVFormatContext* format, AVIOContext** stream, cons
         if (result < 0)
             goto failed;
     }
-    if (input->remote->error < 0 && input->remote->error != AVERROR_EOF) {
+    if (input->remote != NULL && input->remote->error < 0 && input->remote->error != AVERROR_EOF) {
         result = input->remote->error;
         goto failed;
     }
@@ -380,8 +707,20 @@ static int media_input_open (AVFormatContext* format, AVIOContext** stream, cons
     (*stream)->seekable = 0;
     return 0;
 failed:
+    if (media_segment_url (url) && task->control == DOWNLOAD_MEDIA_RUNNING) {
+        /* A missing segment cannot be silently skipped by the demuxer; count
+         * the gap and let the task fail with a clear reason instead of
+         * publishing a recording that pretends to be complete. Pause/cancel
+         * aborts are not gaps. */
+        task->gapCount++;
+        media_progress (task, true, false);
+    }
     av_dict_free (&settings);
     av_free (buffer);
+    if (input->cacheRead != NULL)
+        (void)fclose (input->cacheRead);
+    if (input->cacheWrite != NULL)
+        (void)fclose (input->cacheWrite);
     if (input->remote != NULL)
         avio_closep (&input->remote);
     c_free (input->prefix);
@@ -474,6 +813,57 @@ static void media_filename (ProtocolTask* task)
         task->callbacks.onFileName (task->userData, filename);
 }
 
+static int media_record_options (ProtocolTask* task, const char* extra)
+{
+    CJsonDocument* document;
+    CJsonValue*    record;
+    int            result = 0;
+
+    if (extra == NULL || extra[0] == '\0')
+        return 0;
+    document = c_json_document_new_from_data (c_string_view_from_cstr (extra), C_JSON_PARSE_NONE, NULL);
+    if (document == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (c_json_value_type (c_json_document_root (document)) != C_JSON_TYPE_OBJECT) {
+        errno = EINVAL;
+        result = -1;
+        goto done;
+    }
+    record = c_json_object_get (c_json_document_root (document), c_string_view_from_cstr ("record"));
+    if (record != NULL) {
+        CJsonValue* duration;
+        CJsonValue* size;
+        int64_t     durationValue = 0;
+        int64_t     sizeValue = 0;
+        if (c_json_value_type (record) != C_JSON_TYPE_OBJECT) {
+            errno = EINVAL;
+            result = -1;
+            goto done;
+        }
+        duration = c_json_object_get (record, c_string_view_from_cstr ("duration"));
+        if (duration != NULL &&
+            (c_json_value_get_int64 (duration, &durationValue) != 0 || durationValue <= 0 ||
+             durationValue > 7 * 24 * 3600)) {
+            errno = EINVAL;
+            result = -1;
+            goto done;
+        }
+        size = c_json_object_get (record, c_string_view_from_cstr ("size"));
+        if (size != NULL && (c_json_value_get_int64 (size, &sizeValue) != 0 || sizeValue <= 0)) {
+            errno = EINVAL;
+            result = -1;
+            goto done;
+        }
+        task->recordDurationSeconds = (uint32_t)durationValue;
+        task->recordSizeBytes = (uint64_t)sizeValue;
+    }
+done:
+    c_json_document_free (document);
+    return result;
+}
+
 static int media_open (ProtocolTask** result, const DownloadTask* task, const ProtocolCallbacks* callbacks,
                        void* userData)
 {
@@ -497,11 +887,23 @@ static int media_open (ProtocolTask** result, const DownloadTask* task, const Pr
     snprintf (context->url, sizeof (context->url), "%s", media_source_url (task->resourceUrl));
     snprintf (context->tempPath, sizeof (context->tempPath), "%s", task->tempPath);
     context->dash = strcmp (task->protocol, "dash") == 0;
+    if (media_record_options (context, task->extraJson) != 0) {
+        c_free (context);
+        return -1;
+    }
     if (callbacks != NULL)
         context->callbacks = *callbacks;
     context->userData = userData;
     *result = context;
     return 0;
+}
+
+static void media_cache_remove (ProtocolTask* task)
+{
+    if (task->cacheDirectory[0] != '\0') {
+        (void)c_directory_remove_recursive (task->cacheDirectory);
+        task->cacheDirectory[0] = '\0';
+    }
 }
 
 static int media_run (ProtocolTask* task)
@@ -539,6 +941,26 @@ static int media_run (ProtocolTask* task)
     media_filename (task);
     if (media_interrupt (task))
         goto finished;
+    if (snprintf (task->cacheDirectory, sizeof (task->cacheDirectory), "%s.segments", task->tempPath) >=
+        (int)sizeof (task->cacheDirectory)) {
+        result = AVERROR (ENAMETOOLONG);
+        stage = "segment cache path is too long";
+        goto finished;
+    }
+    if (c_directory_create_with_mode (task->cacheDirectory, 0700) != 0 && errno != EEXIST) {
+        result = AVERROR (errno);
+        stage = "cannot create segment cache";
+        goto finished;
+    }
+    {
+        struct stat cacheStatus;
+        if (lstat (task->cacheDirectory, &cacheStatus) != 0 || !S_ISDIR (cacheStatus.st_mode) ||
+            S_ISLNK (cacheStatus.st_mode)) {
+            result = AVERROR (EINVAL);
+            stage = "segment cache is not a private directory";
+            goto finished;
+        }
+    }
     input = avformat_alloc_context ();
     if (input == NULL) {
         result = AVERROR (ENOMEM);
@@ -563,6 +985,10 @@ static int media_run (ProtocolTask* task)
     result = av_dict_set (&settings, "protocol_whitelist", DOWNLOADER_MEDIA_WHITELIST, 0);
     if (result >= 0)
         result = av_dict_set (&settings, "http_persistent", "0", 0);
+    /* Record a live window from its oldest segment, so the recording includes
+     * codec setup instead of starting at the live edge. */
+    if (result >= 0)
+        result = av_dict_set (&settings, "live_start_index", "0", 0);
     if (result >= 0 && !task->dash)
         result = av_dict_set (&settings, "http_multiple", "0", 0);
     if (result < 0)
@@ -593,11 +1019,8 @@ static int media_run (ProtocolTask* task)
     result = avformat_find_stream_info (input, NULL);
     if (result < 0 || task->networkError != 0)
         goto finished;
-    if (input->duration <= 0 || input->duration == AV_NOPTS_VALUE) {
-        result = AVERROR (ENOTSUP);
-        stage = "VOD requires a finite declared duration";
-        goto finished;
-    }
+    /* Live windows can report a finite duration; the manifest type is
+     * authoritative and already set by media_validate_manifest. */
     selected[0] = av_find_best_stream (input, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     selected[1] = av_find_best_stream (input, AVMEDIA_TYPE_AUDIO, -1, selected[0], NULL, 0);
     if (selected[0] < 0 && selected[1] < 0) {
@@ -698,27 +1121,59 @@ static int media_run (ProtocolTask* task)
         if (result < 0)
             goto finished;
         packetsWritten = true;
+        {
+            int64_t durationUs = 0;
+            for (int slot = 0; slot < 2; slot++) {
+                if (first[slot] != AV_NOPTS_VALUE && last[slot] != AV_NOPTS_VALUE &&
+                    last[slot] - first[slot] > durationUs)
+                    durationUs = last[slot] - first[slot];
+            }
+            task->durationMillis = durationUs / 1000;
+        }
+        if ((task->recordDurationSeconds > 0 &&
+             task->durationMillis >= (int64_t)task->recordDurationSeconds * 1000) ||
+            (task->recordSizeBytes > 0 && task->writtenLength >= task->recordSizeBytes)) {
+            task->control = DOWNLOAD_MEDIA_STOP;
+            break;
+        }
     }
-    if (task->control != DOWNLOAD_MEDIA_RUNNING)
+    if (task->control == DOWNLOAD_MEDIA_STOP && (!task->live || task->networkError != 0)) {
+        /* A VOD finish (or a finish after a failed segment) must not publish a
+         * truncated file as complete. */
+        result = task->networkError != 0 ? task->networkError : AVERROR (ENOTSUP);
+        stage = "recording finish is only valid for a complete live segment stream";
         goto finished;
-    if (result != AVERROR_EOF || task->networkError != 0)
-        goto finished;
-    result = AVERROR_INVALIDDATA;
-    stage = "incomplete media timeline or empty VOD";
-    if (!packetsWritten)
-        goto finished;
-    /* Detect demuxers turning a truncated final segment into EOF. Allow normal
-     * mux/manifest rounding, but never silently accept a missing whole segment. */
-    for (int slot = 0; slot < 2; slot++) {
-        if (selected[slot] >= 0 && (first[slot] == AV_NOPTS_VALUE ||
-            last[slot] - first[slot] + 500000 < input->duration))
+    }
+    {
+        bool finishedByStop = task->control == DOWNLOAD_MEDIA_STOP;
+        if (!finishedByStop && task->control != DOWNLOAD_MEDIA_RUNNING)
             goto finished;
+        if (!finishedByStop && (result != AVERROR_EOF || task->networkError != 0))
+            goto finished;
+        result = AVERROR_INVALIDDATA;
+        stage = "incomplete media timeline or empty recording";
+        if (!packetsWritten)
+            goto finished;
+        if (finishedByStop) {
+            result = 0;
+        } else if (!task->live) {
+            /* Detect demuxers turning a truncated final segment into EOF. Allow
+             * normal mux/manifest rounding, but never silently accept a missing
+             * whole segment for a finite VOD. */
+            for (int slot = 0; slot < 2; slot++) {
+                if (selected[slot] >= 0 && (first[slot] == AV_NOPTS_VALUE ||
+                    last[slot] - first[slot] + 500000 < input->duration))
+                    goto finished;
+            }
+        }
     }
     stage = "writing Matroska trailer";
     result = av_write_trailer (output);
     avio_flush (destination);
     if (result >= 0 && destination->error < 0)
         result = destination->error;
+    if (result >= 0 && (task->control == DOWNLOAD_MEDIA_RUNNING || task->control == DOWNLOAD_MEDIA_STOP))
+        media_cache_remove (task);
 finished:
     av_free (effectiveUrl);
     av_dict_free (&settings);
@@ -739,6 +1194,7 @@ finished:
     }
     task->active = false;
     if (task->control == DOWNLOAD_MEDIA_CANCELLED) {
+        media_cache_remove (task);
         errno = ECANCELED;
         return -1;
     }
@@ -761,12 +1217,12 @@ finished:
         return -1;
     }
     media_progress (task, true, true);
-    if (task->control != DOWNLOAD_MEDIA_RUNNING) {
-        if (task->control == DOWNLOAD_MEDIA_PAUSED) {
-            if (task->callbacks.onPaused != NULL)
-                task->callbacks.onPaused (task->userData);
-            return 1;
-        }
+    if (task->control == DOWNLOAD_MEDIA_PAUSED) {
+        if (task->callbacks.onPaused != NULL)
+            task->callbacks.onPaused (task->userData);
+        return 1;
+    }
+    if (task->control == DOWNLOAD_MEDIA_CANCELLED) {
         errno = ECANCELED;
         return -1;
     }
@@ -806,9 +1262,39 @@ static int media_cancel (ProtocolTask* task)
     return 0;
 }
 
+static int media_stop (ProtocolTask* task)
+{
+    if (task == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!task->live) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    if (task->control != DOWNLOAD_MEDIA_CANCELLED)
+        task->control = DOWNLOAD_MEDIA_STOP;
+    return 0;
+}
+
 static void media_close (ProtocolTask* task)
 {
     c_free (task);
+}
+
+static bool media_retryable (ProtocolTask* task, int errorCode, const char* message)
+{
+    (void)errorCode;
+    (void)message;
+    if (task == NULL || task->networkError == 0)
+        return false;
+    /* A missing/unopenable segment is a content error, not a transient network
+     * interruption; keep it terminal instead of retrying a broken playlist. */
+    if (task->gapCount > 0)
+        return false;
+    return task->networkError != AVERROR_EXIT && task->networkError != AVERROR (ENOTSUP) &&
+           task->networkError != AVERROR (EACCES) && task->networkError != AVERROR (EINVAL) &&
+           task->networkError != AVERROR (ENOSPC) && task->networkError != AVERROR (EROFS);
 }
 
 const ProtocolOps* media_protocol_ops (void)
@@ -816,7 +1302,7 @@ const ProtocolOps* media_protocol_ops (void)
     static const ProtocolOps ops = {
         .name = "media", .canHandle = media_can_handle, .open = media_open,
         .run = media_run, .pause = media_pause, .resume = media_resume,
-        .cancel = media_cancel, .close = media_close
+        .cancel = media_cancel, .stop = media_stop, .close = media_close, .retryable = media_retryable
     };
     return &ops;
 }

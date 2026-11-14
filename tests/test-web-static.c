@@ -10,6 +10,31 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#ifndef DOWNLOADER_TEST_WEB_ROOT
+#define DOWNLOADER_TEST_WEB_ROOT "../web"
+#endif
+
+static int reserve_port (void)
+{
+    struct sockaddr_in address;
+    socklen_t          length = sizeof (address);
+    int                fd;
+    int                port;
+
+    fd = socket (AF_INET, SOCK_STREAM, 0);
+    assert (fd >= 0);
+    memset (&address, 0, sizeof (address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl (INADDR_LOOPBACK);
+    address.sin_port = htons (0);
+    assert (bind (fd, (struct sockaddr*)&address, sizeof (address)) == 0);
+    assert (getsockname (fd, (struct sockaddr*)&address, &length) == 0);
+    port = (int)ntohs (address.sin_port);
+    (void)close (fd);
+    assert (port > 0);
+    return port;
+}
+
 static int handle_not_found (const WebRequest* request, WebResponse* response, void* userData)
 {
     (void)request;
@@ -25,7 +50,7 @@ static void request_and_assert (int port, const char* path, const char* expected
 {
     struct sockaddr_in address;
     char               request[512];
-    char               response[8192];
+    char               response[65536];
     int                fd;
     ssize_t            received;
 
@@ -43,7 +68,8 @@ static void request_and_assert (int port, const char* path, const char* expected
     while (received < (ssize_t)sizeof (response) - 1 &&
            (strstr (response, expectedStatus) == NULL || strstr (response, expectedBody) == NULL)) {
         ssize_t count = recv (fd, response + received, sizeof (response) - 1U - (size_t)received, 0);
-        assert (count > 0);
+        if (count <= 0)
+            break;
         received += count;
         response[received] = '\0';
     }
@@ -55,13 +81,24 @@ static void request_and_assert (int port, const char* path, const char* expected
 
 int main (void)
 {
-    WebOptions options = { .listen = "127.0.0.1", .port = 38128, .documentRoot = "../web" };
+    int         port = reserve_port ();
+    WebOptions  options = { .listen = "127.0.0.1", .port = port, .documentRoot = DOWNLOADER_TEST_WEB_ROOT };
     Web*        web = web_new (&options, handle_not_found, NULL);
 
     assert (web != NULL);
     assert (web_start (web) == 0);
     request_and_assert (options.port, "/", "200 OK", "Downloader");
+    request_and_assert (options.port, "/", "200 OK", "name=\"baidu_pwd\"");
+    request_and_assert (options.port, "/", "200 OK", "name=\"baidu_path\"");
+    request_and_assert (options.port, "/", "200 OK", "<option value=\"cookie\">");
+    request_and_assert (options.port, "/", "200 OK", "id=\"baidu-options\"");
+    request_and_assert (options.port, "/", "200 OK", "id=\"action-status\"");
     request_and_assert (options.port, "/app.js", "200 OK", "fetch");
+    request_and_assert (options.port, "/app.js", "200 OK", "data-action=\"copy\"");
+    request_and_assert (options.port, "/app.js", "200 OK", "navigator.clipboard");
+    request_and_assert (options.port, "/app.js", "200 OK", "extra.baidu");
+    request_and_assert (options.port, "/app.js", "200 OK", "/api/groups/");
+    request_and_assert (options.port, "/app.js", "200 OK", "group_id");
     request_and_assert (options.port, "/missing.css", "404 Not Found", "not_found");
     request_and_assert (options.port, "/../CMakeLists.txt", "400 Bad Request", "path_traversal");
     web_stop (web);

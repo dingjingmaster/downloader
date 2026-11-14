@@ -135,16 +135,39 @@ static int filesystem_sync_tree (const char* path)
     return result;
 }
 
+/* Adapters may keep a private sidecar next to the temporary file. */
+static int filesystem_remove_sidecar (const char* tempPath)
+{
+    char path[DOWNLOAD_TASK_PATH_SIZE];
+    struct stat status;
+
+    if (tempPath == NULL || tempPath[0] == '\0')
+        return 0;
+    if (snprintf (path, sizeof (path), "%s.segments", tempPath) >= (int)sizeof (path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (lstat (path, &status) != 0)
+        return errno == ENOENT ? 0 : -1;
+    return S_ISDIR (status.st_mode) ? c_directory_remove_recursive (path) : 0;
+}
+
 int filesystem_remove_partial (const DownloadTask* task)
 {
     struct stat status;
+    int result;
+
     if (task == NULL || task->tempPath[0] == '\0' || filesystem_has_parent_reference (task->tempPath)) {
         errno = EINVAL;
         return -1;
     }
+    result = filesystem_remove_sidecar (task->tempPath);
     if (lstat (task->tempPath, &status) != 0)
-        return errno == ENOENT ? 0 : -1;
-    return S_ISDIR (status.st_mode) ? c_directory_remove_recursive (task->tempPath) : unlink (task->tempPath);
+        return errno == ENOENT ? result : -1;
+    {
+        int removed = S_ISDIR (status.st_mode) ? c_directory_remove_recursive (task->tempPath) : unlink (task->tempPath);
+        return result != 0 ? result : removed;
+    }
 }
 
 int filesystem_commit (const DownloadTask* task)
@@ -163,6 +186,7 @@ int filesystem_commit (const DownloadTask* task)
     /* Atomic no-replace also prevents concurrent tasks from overwriting results. */
     if (renameat2 (AT_FDCWD, task->tempPath, AT_FDCWD, task->targetPath, RENAME_NOREPLACE) != 0)
         return -1;
+    (void)filesystem_remove_sidecar (task->tempPath);
     int descriptor = open (task->targetDirectory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (descriptor < 0)
         return 1;

@@ -12,11 +12,12 @@ C_BEGIN_EXTERN_C
  * The core publishes/removes the directory. Its .downloader-aria child is
  * reserved for owned metadata. Symlink parents are allowed, but stage entries
  * must not be links or concurrently modified outside the worker.
- * run returns 0 on success, 1 on pause (controls retained), -1 with errno on
- * failure/cancel. Callbacks run on the worker, including while waiting for the
- * single-session lock; pause/cancel may be called from onProgress.
- * close must follow run, never race with it. All libaria2 users must be
- * serialized; engine self-checks must precede tasks. Join workers before exit. */
+ * A dedicated engine thread owns the single libaria2 session and all GIDs;
+ * download workers queue commands and wait for snapshots. run returns 0 on
+ * success, 1 on pause (controls retained), -1 with errno on failure/cancel.
+ * Callbacks run on the task's worker thread; pause/cancel may be called from
+ * onProgress. close must follow run, never race with it. finish joins the
+ * engine thread and must be called after every worker has returned. */
 const ProtocolOps* aria_protocol_ops (void);
 
 C_END_EXTERN_C

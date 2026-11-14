@@ -2,3 +2,8 @@
 /.ccls-cache/
 
 *.db
+__pycache__/
+*.db-journal
+*.db.key
+/pack/build/
+/pack/dist/

@@ -13,6 +13,25 @@ static bool protocol_path_ends_with (const char* path, size_t size, const char* 
     return size >= suffixSize && strncasecmp (path + size - suffixSize, suffix, suffixSize) == 0;
 }
 
+static bool protocol_authority_host_is (CStringView authority, const char* expected)
+{
+    const char* start = authority.data;
+    size_t      size = authority.size;
+    const char* separator;
+
+    if (start == NULL || size == 0)
+        return false;
+    separator = (const char*)memchr (start, '@', size);
+    if (separator != NULL) {
+        size -= (size_t)(separator - start) + 1U;
+        start = separator + 1;
+    }
+    separator = (const char*)memchr (start, ':', size);
+    if (separator != NULL)
+        size = (size_t)(separator - start);
+    return strlen (expected) == size && strncasecmp (start, expected, size) == 0;
+}
+
 int protocol_detect (const char* url, char* protocol, size_t capacity)
 {
     CUri uri;
@@ -42,7 +61,14 @@ int protocol_detect (const char* url, char* protocol, size_t capacity)
     else if (strcmp (scheme, "dash+http") == 0 || strcmp (scheme, "dash+https") == 0)
         detected = "dash";
     else if (strcmp (scheme, "http") == 0 || strcmp (scheme, "https") == 0 || strcmp (scheme, "file") == 0) {
-        if (protocol_path_ends_with (path, pathSize, ".torrent"))
+        if (strcmp (scheme, "file") != 0 &&
+            (protocol_authority_host_is (uri.authority, "pan.baidu.com") ||
+             protocol_authority_host_is (uri.authority, "yun.baidu.com") ||
+             protocol_authority_host_is (uri.authority, "eyun.baidu.com")) &&
+            ((pathSize > 3U && strncmp (path, "/s/", 3U) == 0) ||
+             (pathSize == 11U && strncmp (path, "/share/init", 11U) == 0))) {
+            detected = "baidu";
+        } else if (protocol_path_ends_with (path, pathSize, ".torrent"))
             detected = "bittorrent";
         else if (protocol_path_ends_with (path, pathSize, ".meta4") || protocol_path_ends_with (path, pathSize, ".metalink"))
             detected = "metalink";
@@ -53,7 +79,9 @@ int protocol_detect (const char* url, char* protocol, size_t capacity)
         else if (strcmp (scheme, "file") == 0)
             detected = NULL;
     } else if (strcmp (scheme, "ftp") != 0 && strcmp (scheme, "ftps") != 0 &&
-               strcmp (scheme, "sftp") != 0 && strcmp (scheme, "smb") != 0 && strcmp (scheme, "magnet") != 0) {
+               strcmp (scheme, "sftp") != 0 && strcmp (scheme, "smb") != 0 &&
+               strcmp (scheme, "smb1") != 0 && strcmp (scheme, "magnet") != 0 &&
+               strcmp (scheme, "baidu") != 0) {
         detected = NULL;
     }
     c_free (path);
@@ -91,6 +119,14 @@ int protocol_register (const ProtocolOps* ops)
     }
     gProtocols[gProtocolCount++] = ops;
     return 0;
+}
+
+void protocol_finish_all (void)
+{
+    for (size_t index = 0; index < gProtocolCount; index++) {
+        if (gProtocols[index]->finish != NULL)
+            gProtocols[index]->finish ();
+    }
 }
 
 const ProtocolOps* protocol_find (const char* url, const char* protocol)

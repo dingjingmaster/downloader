@@ -11,10 +11,13 @@
     <header><h1>↓ Downloader</h1><p>管理下载，掌握每一份进度</p></header>
     <div class="toolbar">
       <div class="button-row"><button id="new-task" class="primary">＋ 新建任务</button>
-      <button id="clear-completed">清空已完成</button></div>
+      <button id="clear-completed">清空已完成</button>
+      <button id="profiles">凭据/代理</button>
+      <button id="logout" hidden>退出登录</button></div>
       <span id="summary" role="status"></span>
     </div>
     <p id="action-error" role="alert"></p>
+    <p id="action-status" role="status"></p>
     <dialog id="create-dialog">
     <h2>新建下载任务</h2>
     <form id="create-form">
@@ -29,6 +32,13 @@
         <label>User-Agent<input name="http_user_agent" maxlength="512" placeholder="默认使用下载器标识"></label>
         <label>Referer<input name="http_referer" type="url" maxlength="512" placeholder="资源所在页面地址"></label>
       </details>
+      <details class="request-options" id="baidu-options" hidden>
+        <summary>百度网盘选项（可选）</summary>
+        <label>提取码<input name="baidu_pwd" maxlength="16" placeholder="分享提取码"></label>
+        <label>分享内路径 / 网盘内路径<input name="baidu_path" maxlength="1024" placeholder="/资料/2024（可选）"></label>
+      </details>
+      <label>认证配置<select name="auth_profile"><option value="">不使用</option></select></label>
+      <label>代理配置<select name="proxy_profile"><option value="">不使用</option></select></label>
       <p id="create-error" role="alert"></p>
       <div class="dialog-actions button-row">
         <button type="button" id="cancel-create">取消</button>
@@ -47,9 +57,44 @@
         <button type="button" id="directory-select" class="primary">选择此文件夹</button>
       </div>
     </dialog>
+    <dialog id="login-dialog">
+      <h2>登录</h2>
+      <form id="login-form">
+        <label>用户名<input name="username" autocomplete="username" required></label>
+        <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+        <p id="login-error" role="alert"></p>
+        <div class="dialog-actions button-row"><button type="submit" class="primary">登录</button></div>
+      </form>
+    </dialog>
+    <dialog id="profiles-dialog">
+      <h2>凭据与代理</h2>
+      <p id="profile-error" role="alert"></p>
+      <h3>认证配置</h3>
+      <form id="auth-profile-form">
+        <label>名称<input name="name" required maxlength="63"></label>
+        <label>类型<select name="kind"><option value="basic">Basic</option><option value="digest">Digest</option><option value="bearer">Bearer</option><option value="cookie">Cookie（BDUSS/STOKEN）</option></select></label>
+        <label>用户名<input name="username" maxlength="255"></label>
+        <label>密码/令牌<input name="secret" type="password" autocomplete="off"></label>
+        <p class="field-hint">Cookie 类型请粘贴完整 Cookie 头，至少包含 BDUSS 和 STOKEN。</p>
+        <p id="auth-profile-error" role="alert"></p>
+        <button type="submit">保存认证配置</button>
+      </form>
+      <div id="auth-profile-list" class="profile-list"></div>
+      <h3>代理配置</h3>
+      <form id="proxy-profile-form">
+        <label>名称<input name="name" required maxlength="63"></label>
+        <label>代理地址<input name="url" placeholder="http://host:port 或 socks5h://host:port" required></label>
+        <label>用户名<input name="username" maxlength="255"></label>
+        <label>密码<input name="secret" type="password" autocomplete="off"></label>
+        <p id="proxy-profile-error" role="alert"></p>
+        <button type="submit">保存代理配置</button>
+      </form>
+      <div id="proxy-profile-list" class="profile-list"></div>
+      <div class="dialog-actions"><button type="button" id="profiles-close">关闭</button></div>
+    </dialog>
     <div class="table-scroll">
     <table>
-      <thead><tr><th>文件</th><th>协议</th><th>状态</th><th>进度</th><th>大小</th><th>操作</th></tr></thead>
+      <thead><tr><th>文件</th><th>协议</th><th>状态</th><th>进度</th><th>速度</th><th>大小</th><th>操作</th></tr></thead>
       <tbody id="tasks"></tbody>
     </table>
     </div>

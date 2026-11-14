@@ -87,6 +87,31 @@ static void test_web_rejects_invalid_port (const char* root)
     assert (errno == EINVAL);
 }
 
+static void test_web_auth_requires_both_credentials (const char* root)
+{
+    char    path[512];
+    char*   argv[4];
+    Config* config;
+
+    snprintf (path, sizeof (path), "%s/username-only.ini", root);
+    write_config (path, "[web]\nusername = admin\n");
+    argv[0] = (char*)"downloader";
+    argv[1] = (char*)"--config";
+    argv[2] = path;
+    argv[3] = NULL;
+    errno = 0;
+    config = config_load (3, argv);
+    assert (config == NULL);
+    assert (errno == EINVAL);
+
+    snprintf (path, sizeof (path), "%s/password-only.ini", root);
+    write_config (path, "[web]\npassword = secret\n");
+    errno = 0;
+    config = config_load (3, argv);
+    assert (config == NULL);
+    assert (errno == EINVAL);
+}
+
 int main (void)
 {
     char  templatePath[] = "/tmp/downloader-web-config-XXXXXX";
@@ -96,5 +121,6 @@ int main (void)
     test_web_defaults (root);
     test_web_can_be_disabled (root);
     test_web_rejects_invalid_port (root);
+    test_web_auth_requires_both_credentials (root);
     return 0;
 }

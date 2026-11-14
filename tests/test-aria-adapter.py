@@ -39,6 +39,8 @@ int main (int argc, char** argv)
         return 3;
     int result = operations->run (task);
     operations->close (task);
+    if (operations->finish)
+        operations->finish ();
     return result == 0 ? 0 : 1;
 }
 '''
@@ -67,10 +69,13 @@ def main():
                 '-lz', '-lexpat', '-lssl', '-lcrypto', '-pthread', '-ldl', '-lm',
                 '-o', str(executable)], check=True)
 
+            environment = dict(os.environ, XDG_CACHE_HOME=str(root / 'cache'))
+
             def run(url, protocol, stage, success=True):
-                result = subprocess.run([str(executable), url, protocol, str(stage)],
+                result = subprocess.run([str(executable), url, protocol, str(stage)], env=environment,
                                         capture_output=True, text=True, timeout=45)
-                assert (result.returncode == 0) == success, result.stderr
+                assert (result.returncode == 0) == success, (result.returncode, result.stderr)
+                assert (root / 'cache/downloader/aria2').is_dir(), 'aria engine directory missing'
 
             def files(stage):
                 return {path.relative_to(stage).as_posix(): path.read_bytes()
@@ -81,6 +86,12 @@ def main():
                         f'<size>{len(payload)}</size><hash type="sha-256">'
                         f'{hashlib.sha256(payload).hexdigest()}</hash><url>{url}</url>'
                         '</file></metalink>').encode()
+
+            # A stage paused by the pre-engine adapter still holds its DHT files.
+            legacy = root / 'chain' / '.downloader-aria'
+            legacy.mkdir(parents=True)
+            (legacy / 'dht').write_bytes(b'legacy dht state')
+            (legacy / 'dht6').write_bytes(b'legacy dht6 state')
 
             payload = b'actual payload with control-looking suffix\n' * 4096
             fixture.documents['/payload.aria2'] = payload

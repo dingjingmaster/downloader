@@ -41,6 +41,14 @@ int main (void)
     assert (strcmp (detected, "bittorrent") == 0);
     assert (protocol_detect ("file:///etc/passwd", detected, sizeof (detected)) != 0);
     assert (protocol_detect ("unknown://host", detected, sizeof (detected)) != 0);
+    assert (protocol_detect ("baidu:///a/b.bin", detected, sizeof (detected)) == 0);
+    assert (strcmp (detected, "baidu") == 0);
+    assert (protocol_detect ("https://pan.baidu.com/s/1AbCdEf", detected, sizeof (detected)) == 0);
+    assert (strcmp (detected, "baidu") == 0);
+    assert (protocol_detect ("https://yun.baidu.com/s/1AbCdEf", detected, sizeof (detected)) == 0);
+    assert (strcmp (detected, "baidu") == 0);
+    assert (protocol_detect ("https://pan.baidu.com/disk/home", detected, sizeof (detected)) == 0);
+    assert (strcmp (detected, "https") == 0);
 
     assert (protocol_register (&dummy) == 0);
     assert (protocol_register (&dummy) != 0);

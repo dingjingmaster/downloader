@@ -16,6 +16,8 @@ button:focus-visible, input:focus-visible { outline: 3px solid #93b8ff; outline-
 #summary { color: #748198; font-size: 13px; }
 #action-error { margin: 0; padding: 12px 24px; color: #b54450; background: #fff5f5; border: 1px solid #efd5d8; }
 #action-error:empty { display: none; }
+#action-status { margin: 0; padding: 12px 24px; color: #22693f; background: #f1fbf5; border: 1px solid #cceada; }
+#action-status:empty { display: none; }
 .table-scroll { overflow-x: auto; background: white; border: 1px solid #e3e9f2; }
 table { width: 100%; border-collapse: collapse; min-width: 850px; font-size: 13px; }
 th { padding: 14px 20px; text-align: left; background: #f8fafd; color: #7b879b; font-weight: 500; font-size: 12px; white-space: nowrap; }
@@ -60,4 +62,49 @@ dialog p { margin: 0; font-size: 12px; color: #8490a3; }
   h1 { font-size: 23px; }
   .toolbar { padding: 16px; flex-wrap: wrap; }
   .pagination { justify-content: center; padding: 16px; }
+}
+
+.profile-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0 14px;
+}
+
+.profile-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 8px;
+  border: 1px solid #d8dee9;
+  border-radius: 6px;
+}
+
+#login-dialog form,
+#profiles-dialog form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.group-row td {
+  background: #eef3fb;
+  border-top: 2px solid #d6e2f5;
+  font-weight: 600;
+}
+
+.group-row .task-actions {
+  margin-top: 6px;
+}
+
+.group-row .task-note {
+  font-weight: 400;
+  margin-right: 12px;
+}
+
+.field-hint {
+  color: #748198;
+  font-size: 13px;
+  margin: 0 0 8px;
 }

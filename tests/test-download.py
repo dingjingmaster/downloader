@@ -11,6 +11,7 @@ import os
 import sqlite3
 
 payload = b'downloader-local-fixture\n' * 8192
+interrupted = set()
 
 class Fixture(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -32,7 +33,8 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             for index in range(offset, len(payload), 4096):
                 self.wfile.write(payload[index:index + 4096])
                 self.wfile.flush()
-                if self.path == '/interrupt':
+                if self.path == '/interrupt' and self.path not in interrupted:
+                    interrupted.add(self.path)
                     return
                 if self.path == '/slow':
                     time.sleep(.02)
@@ -125,12 +127,13 @@ with tempfile.TemporaryDirectory() as directory:
         api('/' + identifier, method='DELETE')
         assert not (root / f'.{identifier}.part').exists()
         assert not (root / 'delete.bin').exists()
-        identifier = create('failed.bin', 'interrupt')
+        identifier = create('interrupt.bin', 'interrupt')
         api('/' + identifier + '/start', {})
-        assert wait_state(identifier, ['completed', 'failed'])['state'] == 'failed'
-        assert (root / f'.{identifier}.part').exists()
-        assert not (root / 'failed.bin').exists()
-        print('range resume, pause/resume, active delete, interrupted transfer: PASS')
+        current = wait_state(identifier, ['completed', 'failed'])
+        assert current['state'] == 'completed', current
+        assert current['retry_count'] >= 1, current
+        assert (root / 'interrupt.bin').read_bytes() == payload
+        print('interrupted transfer retries until completion: PASS')
         task = api('', {'url': f'http://127.0.0.1:{server.server_port}/attachment'})['task']
         assert task['file_name'] == 'attachment'
         assert task['protocol'] == 'http'

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+  <maintainer type="person">
+    <email>dingjing@live.cn</email>
+    <name>DingJing</name>
+  </maintainer>
+  <longdescription>
+    Downloader is a Unix socket based download daemon supporting HTTP/HTTPS,
+    FTP/SFTP, BitTorrent, Metalink, HLS/DASH and SMB. It stores tasks in
+    SQLite and serves a local web interface.
+  </longdescription>
+</pkgmetadata>

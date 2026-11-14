@@ -1,0 +1,28 @@
+[Unit]
+Description=Downloader background download service with local web interface
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=downloader
+Group=downloader
+StateDirectory=downloader
+StateDirectoryMode=0750
+CacheDirectory=downloader
+CacheDirectoryMode=0750
+RuntimeDirectory=downloader
+RuntimeDirectoryMode=0750
+WorkingDirectory=/var/lib/downloader
+Environment=HOME=/var/lib/downloader
+Environment=XDG_CACHE_HOME=/var/cache/downloader
+ExecStart=/opt/downloader/bin/downloader --config /etc/downloader/download.ini
+Restart=on-failure
+RestartSec=3
+# Tasks may target directories outside the state directory (for example /mnt
+# or /home), so do not apply a filesystem sandbox. Grant the downloader user
+# write access to those target directories separately.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

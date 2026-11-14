@@ -1,0 +1,69 @@
+diff --git a/include/smb2/libsmb2.h b/include/smb2/libsmb2.h
+index f5f14d0..9d18a19 100644
+--- a/include/smb2/libsmb2.h
++++ b/include/smb2/libsmb2.h
+@@ -415,6 +415,10 @@ void smb2_set_password_from_file(struct smb2_context *smb2);
+  * This function is only needed when libsmb2 is built --without-libkrb5
+  */
+ void smb2_set_domain(struct smb2_context *smb2, const char *domain);
++/* Acquire Kerberos credentials from the supplied user/password into an
++ * isolated MEMORY ccache. libsmb2 calls this internal path use_cached_creds;
++ * it does not read the process ccache when enabled. */
++void smb2_set_use_cached_creds(struct smb2_context *smb2, int enable);
+ /*
+  * Set the workstation when authenticating.
+  * This function is only needed when libsmb2 is built --without-libkrb5
+diff --git a/lib/init.c b/lib/init.c
+index bd7b13e..9e6c00b 100644
+--- a/lib/init.c
++++ b/lib/init.c
+@@ -634,6 +634,14 @@ void smb2_set_domain(struct smb2_context *smb2, const char *domain)
+         smb2->domain = strdup(domain);
+ }
+ 
++void smb2_set_use_cached_creds(struct smb2_context *smb2, int enable)
++{
++        if (smb2 == NULL) {
++                return;
++        }
++        smb2->use_cached_creds = enable ? 1 : 0;
++}
++
+ void smb2_set_workstation(struct smb2_context *smb2, const char *workstation)
+ {
+         if (smb2->workstation) {
+diff --git a/lib/krb5-wrapper.c b/lib/krb5-wrapper.c
+index 2f2334a..b6b59a7 100644
+--- a/lib/krb5-wrapper.c
++++ b/lib/krb5-wrapper.c
+@@ -180,9 +180,27 @@ krb5_negotiate_reply(struct smb2_context *smb2,
+         }
+         auth_data->context = GSS_C_NO_CONTEXT;
+ 
+-        if (asprintf(&auth_data->g_server, "cifs@%s", server) < 0) {
+-                smb2_set_error(smb2, "Failed to allocate server string");
+-                return NULL;
++        {
++                /* Kerberos service principal names never include the TCP port.
++                 * libsmb2 receives "host[:port]" (including "[v6]:port"), so
++                 * strip the port before forming cifs@host. */
++                char   host[1024];
++                size_t host_length = strlen(server);
++                const char *colon = strrchr(server, ':');
++                if (colon != NULL) {
++                        const char *bracket = strrchr(server, ']');
++                        if (bracket == NULL || colon > bracket)
++                                host_length = (size_t)(colon - server);
++                }
++                if (host_length >= sizeof(host)) {
++                        smb2_set_error(smb2, "Kerberos server name is too long");
++                        return NULL;
++                }
++                snprintf(host, sizeof(host), "%.*s", (int)host_length, server);
++                if (asprintf(&auth_data->g_server, "cifs@%s", host) < 0) {
++                        smb2_set_error(smb2, "Failed to allocate server string");
++                        return NULL;
++                }
+         }
+ 
+         target.value = auth_data->g_server;

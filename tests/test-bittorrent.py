@@ -13,6 +13,7 @@ import os
 import pathlib
 import socket
 import socketserver
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -213,7 +214,16 @@ class HttpFixture(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Range', f'bytes {offset}-{end}/{len(content)}')
         self.end_headers()
         try:
-            self.wfile.write(content[offset:end + 1])
+            slow = fixture.slow_documents.get(parsed.path)
+            if slow is not None and end - offset > 4096:
+                _, release, responded = slow
+                self.wfile.write(content[offset:offset + 4096])
+                self.wfile.flush()
+                responded.set()
+                release.wait(15)
+                self.wfile.write(content[offset + 4096:end + 1])
+            else:
+                self.wfile.write(content[offset:end + 1])
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -225,6 +235,7 @@ class Fixture:
     def __init__(self):
         self.torrents = {}
         self.documents = {}
+        self.slow_documents = {}
         self.errors = []
         self.stopping = threading.Event()
         self.peer = PeerServer(('127.0.0.1', 0), Peer)
@@ -281,7 +292,8 @@ class Integration:
         self.log = (root / 'daemon.log').open('w+')
         environment = {key: value for key, value in os.environ.items()
                        if key.lower() not in ('http_proxy', 'https_proxy', 'all_proxy')}
-        environment.update(NO_PROXY='127.0.0.1,localhost', no_proxy='127.0.0.1,localhost')
+        environment.update(NO_PROXY='127.0.0.1,localhost', no_proxy='127.0.0.1,localhost',
+                           XDG_CACHE_HOME=str(root / 'cache'))
         self.daemon = subprocess.Popen([binary, '--config', str(config)], env=environment,
                                        stdout=self.log, stderr=subprocess.STDOUT,
                                        start_new_session=True)
@@ -384,6 +396,8 @@ class Integration:
             self.start(task)
             self.verify(task, torrent.expected)
             assert torrent.announced.is_set() and torrent.first_block.is_set(), task
+            # DHT state is engine-level, not per task stage.
+            assert (self.root / 'cache/downloader/aria2').is_dir(), 'aria engine directory missing'
             print(f'PASS remote torrent {"multi" if multi else "single"}-file payload', flush=True)
 
         torrent, _ = self.fixture.torrent('local-source')
@@ -464,8 +478,8 @@ class Integration:
         second_torrent, second_url = self.fixture.torrent('concurrent-second', blocked=True)
         second = self.create(second_url, 'concurrent-second-output')
         self.start(second)
-        # With the serialized aria engine this task waits for the first task;
-        # a parallel engine may already have requested its first payload block.
+        # A shared engine may already have requested the second payload; a
+        # serialized engine leaves it queued until the first task finishes.
         self.state(second, ('queued', 'downloading'))
         self.delete(second)
         second_torrent.release.set()
@@ -474,6 +488,127 @@ class Integration:
         assert not self.stage(second).exists(), 'cancelled waiting task later created a stage'
         assert not (self.downloads / second['file_name']).exists(), second
         print('PASS concurrent tasks and cancellation while engine is occupied', flush=True)
+
+        first, first_torrent = self.blocked('parallel-first')
+        second_torrent, second_url = self.fixture.torrent('parallel-second', blocked=True)
+        second = self.create(second_url, 'parallel-second-output')
+        self.start(second)
+        self.wait(lambda: first_torrent.first_block.is_set() and second_torrent.first_block.is_set(),
+                  'both concurrent tasks requested their first payload block', 15)
+        self.wait(lambda: (self.api('/' + first['id'])['task']['downloaded_bytes'] > 0 and
+                           self.api('/' + second['id'])['task']['downloaded_bytes'] > 0),
+                  'both concurrent tasks report downloaded bytes', 15)
+        first_torrent.release.set()
+        second_torrent.release.set()
+        self.verify(first, first_torrent.expected)
+        self.verify(second, second_torrent.expected)
+        self.delete(first)
+        self.delete(second)
+        print('PASS concurrent tasks progress simultaneously', flush=True)
+
+        first, first_torrent = self.blocked('pause-parallel-first')
+        second_torrent, second_url = self.fixture.torrent('pause-parallel-second', blocked=True)
+        second = self.create(second_url, 'pause-parallel-second-output')
+        self.start(second)
+        self.wait(lambda: first_torrent.first_block.is_set() and second_torrent.first_block.is_set(),
+                  'both parallel tasks reached the payload phase', 15)
+        self.api('/' + first['id'] + '/pause', {})
+        self.state(first, ('paused',), 10)
+        assert self.api('/' + second['id'])['task']['state'] == 'downloading', second
+        second_torrent.release.set()
+        self.verify(second, second_torrent.expected)
+        first_torrent.release.set()
+        self.start(first)
+        self.verify(first, first_torrent.expected)
+        self.delete(first)
+        self.delete(second)
+        print('PASS pausing one task leaves the other downloading', flush=True)
+
+        first_torrent, _ = self.fixture.torrent('magnet-parallel-first', blocked=True)
+        first = self.create(self.fixture.magnet(first_torrent), 'magnet-parallel-first-output')
+        second_torrent, _ = self.fixture.torrent('magnet-parallel-second', blocked=True)
+        second = self.create(self.fixture.magnet(second_torrent), 'magnet-parallel-second-output')
+        self.start(first)
+        self.start(second)
+        self.wait(lambda: first_torrent.first_block.is_set() and second_torrent.first_block.is_set(),
+                  'both magnet tasks reached the payload phase', 20)
+        self.api('/' + first['id'] + '/pause', {})
+        self.state(first, ('paused',), 10)
+        assert self.api('/' + second['id'])['task']['state'] == 'downloading', second
+        second_torrent.release.set()
+        self.verify(second, second_torrent.expected)
+        first_torrent.release.set()
+        self.start(first)
+        self.verify(first, first_torrent.expected)
+        self.delete(first)
+        self.delete(second)
+        print('PASS magnet child GIDs stay isolated across concurrent tasks', flush=True)
+
+        first_release = threading.Event()
+        first_responded = threading.Event()
+        second_release = threading.Event()
+        second_responded = threading.Event()
+        first_name = 'metalink-parallel-first.bin'
+        second_name = 'metalink-parallel-second.bin'
+        first_payload = b'metalink-parallel-first\x00' * 30000
+        second_payload = b'metalink-parallel-second\xff' * 31000
+        for name, payload, release, responded in (
+                (first_name, first_payload, first_release, first_responded),
+                (second_name, second_payload, second_release, second_responded)):
+            self.fixture.documents['/' + name] = payload
+            self.fixture.slow_documents['/' + name] = (payload, release, responded)
+            self.fixture.documents['/' + name + '.meta4'] = (
+                '<?xml version="1.0"?><metalink xmlns="urn:ietf:params:xml:ns:metalink">'
+                f'<file name="{name}"><size>{len(payload)}</size>'
+                f'<hash type="sha-256">{hashlib.sha256(payload).hexdigest()}</hash>'
+                f'<url>{self.fixture.base}/{name}</url></file></metalink>').encode()
+        first = self.create(self.fixture.base + '/' + first_name + '.meta4',
+                            'metalink-parallel-first-output')
+        second = self.create(self.fixture.base + '/' + second_name + '.meta4',
+                             'metalink-parallel-second-output')
+        self.start(first)
+        self.start(second)
+        self.wait(lambda: first_responded.is_set() and second_responded.is_set(),
+                  'both metalink payloads started', 15)
+        self.api('/' + first['id'] + '/pause', {})
+        self.state(first, ('paused',), 10)
+        assert self.api('/' + second['id'])['task']['state'] == 'downloading', second
+        second_release.set()
+        self.verify(second, {second_name: second_payload})
+        first_release.set()
+        self.start(first)
+        self.verify(first, {first_name: first_payload})
+        self.delete(first)
+        self.delete(second)
+        print('PASS metalink child GIDs stay isolated across concurrent tasks', flush=True)
+
+        torrent, _ = self.fixture.torrent('magnet-early-pause')
+        task = self.create(self.fixture.magnet(torrent), 'magnet-early-pause-output')
+        self.start(task)
+        # Pause races metadata completion; stop-time discovery must not leak
+        # followed GIDs, and the task must resume normally.
+        self.api('/' + task['id'] + '/pause', {})
+        self.state(task, ('paused',), 10)
+        self.start(task)
+        self.verify(task, torrent.expected)
+        self.delete(task)
+        print('PASS magnet paused during metadata still resumes once', flush=True)
+
+        task, torrent = self.blocked('shutdown-active')
+        self.daemon.terminate()
+        try:
+            self.daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.daemon.kill()
+            self.daemon.wait(timeout=5)
+            raise AssertionError('active aria engine did not shut down within 5s')
+        torrent.release.set()
+        with sqlite3.connect(self.root / 'meta.db') as database:
+            state = database.execute('SELECT state FROM download_tasks WHERE uuid=?',
+                                     (task['id'],)).fetchone()
+        assert state == ('paused',), state
+        assert self.stage(task).is_dir(), 'shutdown discarded the resumable stage'
+        print('PASS active engine shuts down cleanly and keeps the paused stage', flush=True)
 
     def close(self):
         if self.daemon.poll() is None:
